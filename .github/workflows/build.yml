@@ -13,9 +13,9 @@ on:
         required: false
         default: ''
       server:
-        description: '私服地址 host:port'
+        description: '私服地址 host:port (留空 = 直连官服, 不替换任何服务器地址)'
         required: false
-        default: '127.0.0.1:6645'
+        default: ''
 
 env:
   R8_JAR: ${{ github.workspace }}/.tools/r8.jar
@@ -123,9 +123,14 @@ jobs:
         if: steps.apksrc.outputs.url != ''
         run: |
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
-          python3 ultimate_builder.py official.apk \
-            --server "${{ github.event.inputs.server || '127.0.0.1:6645' }}" \
-            -o output --force
+          SERVER="${{ github.event.inputs.server }}"
+          if [ -n "$SERVER" ]; then
+            echo "[*] 模式: 私服 → $SERVER"
+            python3 ultimate_builder.py official.apk --server "$SERVER" -o output --force
+          else
+            echo "[*] 模式: 直连官服 (不替换服务器地址)"
+            python3 ultimate_builder.py official.apk -o output --force
+          fi
 
       - name: Upload deploy bundle
         if: steps.apksrc.outputs.url != ''
