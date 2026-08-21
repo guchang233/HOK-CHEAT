@@ -249,18 +249,35 @@ def find_ndk() -> Path | None:
                     return sub
     return None
 
+def _find_in_sdk(rel_glob: str) -> Path | None:
+    """在 $ANDROID_HOME 下按 glob 找文件 (SDK cmake 包等)"""
+    import glob as _g
+    for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        v = os.environ.get(env)
+        if v:
+            for p in sorted(_g.glob(f"{v}/{rel_glob}")):
+                return Path(p)
+    return None
+
 def _cmake_bin(ndk: Path) -> Path | None:
-    """NDK 自带 cmake 优先, 否则系统 cmake"""
+    """NDK 自带 cmake 优先, 其次 SDK cmake 包, 最后系统 cmake"""
     inner = ndk / "cmake" / "bin" / "cmake"
     if inner.exists():
         return inner
+    p = _find_in_sdk("cmake/*/bin/cmake")
+    if p:
+        return p
     w = shutil.which("cmake")
     return Path(w) if w else None
 
 def _ninja_bin(ndk: Path) -> Path | None:
+    """NDK 自带 ninja 优先, 其次 SDK cmake 包, 最后系统 ninja"""
     inner = ndk / "cmake" / "bin" / "ninja"
     if inner.exists():
         return inner
+    p = _find_in_sdk("cmake/*/bin/ninja")
+    if p:
+        return p
     w = shutil.which("ninja")
     return Path(w) if w else None
 

@@ -35,15 +35,20 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Android SDK (cmdline-tools + PATH)
+        uses: android-actions/setup-android@v3
+
       - name: Install Android SDK components
         run: |
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install \
             "build-tools;34.0.0" \
             "platforms;android-34" \
+            "cmake;3.22.1" \
             "ndk;${NDK_VERSION}" > /dev/null
           echo "--- installed ---"
           ls "$ANDROID_HOME/build-tools" "$ANDROID_HOME/platforms" "$ANDROID_HOME/ndk"
+          ls "$ANDROID_HOME/cmake"
 
       - name: Download r8
         run: |
