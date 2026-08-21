@@ -62,9 +62,11 @@ jobs:
       #  aapt2/dexdump/apksigner/NDK 全链路 + 注入 + 签名校验
       # ============================================================
       - name: E2E pipeline validation (synthetic APK)
-        run: python3 e2e_test.py
-        env:
-          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: |
+          # ANDROID_HOME 是 runner 默认变量, 不在 env 上下文中 — 用 shell 变量拼接
+          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          echo "NDK_HOME=$NDK_HOME"
+          python3 e2e_test.py
 
       - name: Upload E2E validation artifacts
         if: always()
@@ -91,12 +93,19 @@ jobs:
           fi
 
       - name: Restore signing keys (optional)
-        if: ${{ secrets.SIGNING_KEY_B64 != '' && secrets.SIGNING_CERT_B64 != '' }}
+        env:
+          KEY_B64: ${{ secrets.SIGNING_KEY_B64 }}
+          CERT_B64: ${{ secrets.SIGNING_CERT_B64 }}
         run: |
-          mkdir -p keys
-          printf '%s' "${{ secrets.SIGNING_KEY_B64 }}" | base64 -d > keys/key.pem
-          printf '%s' "${{ secrets.SIGNING_CERT_B64 }}" | base64 -d > keys/cert.pem
-          echo "[✓] 签名密钥已从 secrets 恢复 (签名身份稳定)"
+          # secrets 上下文不能用于 step if, 经 env 桥接后在脚本内判断
+          if [ -n "$KEY_B64" ] && [ -n "$CERT_B64" ]; then
+            mkdir -p keys
+            printf '%s' "$KEY_B64" | base64 -d > keys/key.pem
+            printf '%s' "$CERT_B64" | base64 -d > keys/cert.pem
+            echo "[✓] 签名密钥已从 secrets 恢复 (签名身份稳定)"
+          else
+            echo "[*] 未配置签名 secrets, 本次构建使用临时密钥"
+          fi
 
       - name: Download official APK
         if: steps.apksrc.outputs.url != ''
@@ -108,11 +117,10 @@ jobs:
       - name: Build all-in-one embedded APK
         if: steps.apksrc.outputs.url != ''
         run: |
+          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
           python3 ultimate_builder.py official.apk \
             --server "${{ github.event.inputs.server || '127.0.0.1:6645' }}" \
             -o output --force
-        env:
-          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
 
       - name: Upload deploy bundle
         if: steps.apksrc.outputs.url != ''
