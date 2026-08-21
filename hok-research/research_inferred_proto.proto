@@ -1,0 +1,472 @@
+// HYPOTHESIZED .proto schema for sgame TCP 6645 protocol
+// Auto-generated from FieldNumber constants in global-metadata.dat
+// Field numbers are PLACEHOLDERS ¡ª actual numbers need to be parsed from C# .cctor
+
+syntax = "proto3";
+
+// === Inferred message: BattlePacket / HeroSync (battle state updates) ===
+message HeroInfo {
+    Vector3 hero_position = 1;
+    bool is_visible = 2;
+    int32 camp = 3;
+    Vector3 last_visible_location = 4;
+    int32 last_visible_frame_no = 5;
+    int32 camp_visible = 6;
+    int32 main_hero_camp = 7;
+    int32 main_hero_config_id = 8;
+    int32 main_hero_index = 9;
+    int32 main_hero_runtime_id = 10;
+    int32 player_runtime_id = 11;
+    int32 target_camp = 12;
+    int32 target_config_id = 13;
+    Vector3 target_pos_x = 14;
+    Vector3 target_pos_z = 15;
+    int32 target_runtime_id = 16;
+    int32 frame_no = 17;
+    int32 frame_id = 18;
+    int32 dead_frame_no = 19;
+    int32 last_dead_frameno = 20;
+    int32 hero_count = 21;
+    bytes hero_kill_record = 22;
+    repeated Hero heros = 23;
+    repeated HeroUpdate hero_updates = 24;
+    bytes cooldown = 25;
+    int32 slot_skill_id = 26;
+    repeated Skill skills = 27;
+    bytes skill_slots_damage = 28;
+    bytes skilluse_record = 29;
+    repeated NewSkillEvent new_skill_events = 30;
+    int32 battle_id = 31;
+    bytes in_battle_info = 32;
+    bytes ops_target = 33;
+    bytes attack_target = 34;
+}
+
+message Vector3 {
+    float x = 1;
+    float y = 2;
+    float z = 3;
+}
+
+// === All FieldNumber field names (lookup table) ===
+// AcntUniq
+// ActionId
+// ActiveEvents
+// AggregateValue
+// AllowAlias
+// AnimationCount
+// AnimatorCount
+// Annotation
+// AreaId
+// AssistCnt
+// AssistRuntimeIds
+// AtkRange
+// AtkSpd
+// AttackTarget
+// Attackers
+// BAOJUN
+// BARON
+// BIGDRAGON
+// BatNowCurrent
+// BattleId
+// Begin
+// BehavMode
+// BloodChangeRatio
+// BoolValue
+// BubbleTextAnimationType
+// BubbleTextShowTime
+// BufState
+// BuffStart
+// CakeUpdates
+// Cakes
+// Camp
+// CampVisible
+// Cardinality
+// CcEnableArenas
+// CcGenericServices
+// CdReduce
+// CdnTextContent
+// ChatContent
+// ChatContentType
+// ChatInfoData
+// ChatStrategySwitch
+// ChatText
+// ChosenData
+// ClickedData
+// ClickedType
+// ClientStreaming
+// CommonInfo
+// CompilerVersion
+// ConfigId
+// ConfirmData
+// Content
+// Cooldown
+// Cpu
+// CpuLoadIndex
+// CpuPerfIndex
+// CritEffe
+// CritRate
+// CsharpNamespace
+// CtrlReduce
+// Ctype
+// DARKBIGDRAGON
+// DamageValue
+// DataType
+// DayNight
+// DeadCnt
+// DeadFrameNo
+// DeadInfos
+// DeathConfigId
+// DeathNum
+// DeathRuntimeId
+// DebugRedact
+// Declaration
+// DefaultValue
+// Dependency
+// Deprecated
+// DeprecatedLegacyJsonFieldConflicts
+// DeskId
+// DeskSeq
+// DisplayData
+// DisplayType
+// DoHurtInfos
+// DoubleValue
+// Edition
+// ElementType
+// Elements
+// Emotion
+// End
+// EndFlag
+// EntityId
+// EnumType
+// Enumvalue
+// EpRatio
+// EpRecover
+// EquipData
+// EquipId
+// Equipment
+// Error
+// EventId
+// EventType
+// ExecuteCommandCnt
+// Exist
+// Extendee
+// Extension
+// ExtensionRange
+// ExtraParams1
+// ExtraParams2
+// ExtraParams3
+// Field
+// 
+// Fields
+// File
+// FileName
+// FileToGenerate
+// ForbidSpeakData
+// Fps
+// FrameId
+// FrameNo
+// FuhuojiaIsUsable
+// FullName
+// GameinfoVersion
+// Gender
+// GeneratedCodeInfo
+// GetTag
+// GoPackage
+// Gpu
+// GpuLoadIndex
+// GpuPerfIndex
+// Gradeofrank
+// HeadUrl
+// HeroCount
+// HeroKillRecord
+// HeroPosition
+// HeroUpdates
+// Heros
+// HighlighterId
+// Highlights
+// HostDeadInfoData
+// HpChangeRatio
+// HpRatio
+// HpRecover
+// Id
+// IdempotencyLevel
+// IdentifierValue
+// InBattleInfo
+// InbattleChatEventData
+// InbattlePanelData
+// Infos
+// InputType
+// InsertionPoint
+// InstructionData
+// InstructionIds
+// InstructionType
+// InteractionData
+// InteractionText
+// IntercationEvent
+// IsChatMsg
+// IsExtension
+// IsFirstQuery
+// IsInterruptMax
+// IsKiller
+// IsLingbao
+// IsLocalTts
+// IsRepeated
+// IsSafe
+// IsSuccess
+// IsVisible
+// JavaGenerateEqualsAndHash
+// JavaGenericServices
+// JavaMultipleFiles
+// JavaOuterClassname
+// JavaPackage
+// JavaStringCheckUtf8
+// JsonName
+// Jstype
+// JumpEntry
+// JumpParam1
+// JumpParam2
+// JumpformData
+// KillCnt
+// KillNum
+// KillOrganCnt
+// KillerConfigId
+// KillerId
+// KillerRuntimeId
+// Kind
+// Label
+// LastDeadFrameno
+// LastUseTime
+// LastVisibleFrameNo
+// LastVisibleLocation
+// Lazy
+// LeadingComments
+// LeadingDetachedComments
+// LeftInteractionBtnText
+// LeftInteractionSignalText
+// Level
+// LiftTimestamp
+// LineType
+// LingbaoVolumeLevel
+// ListValue
+// Location
+// LogicWorldId
+// MachineState
+// MainHeroCamp
+// MainHeroConfigId
+// MainHeroIndex
+// MainHeroRuntimeId
+// MainThreadTime
+// Major
+// MapEntry
+// MaxEp
+// MaxHp
+// MessageSetWireFormat
+// MessageType
+// Method
+// Methods
+// MgcArmorHurt
+// MgcAtk
+// MgcDamagePercent
+// MgcDef
+// MgcVamp
+// Minor
+// Mixins
+// MoneyCnt
+// Money
+// MonsterKillRecord
+// MonsterUpdates
+// Monsters
+// MovSpd
+// Msg
+// Name
+// NamePart_
+// Nanos
+// NegativeIntValue
+// NestedType
+// NewActiveEvents
+// NewDeadEvents
+// NewHighlights
+// NewSkillEvents
+// NoStandardDescriptorAccessor
+// NullValue
+// Num
+// Number
+// NumberValue
+// ObjcClassPrefix
+// OneWayInfoData
+// OneofDecl
+// OneofIndex
+// Oneofs
+// OpCode
+// Openid
+// OpsTarget
+// OptimizeFor
+// Options
+// OrganBrach
+// OrganUpdates
+// Organs
+// OutputType
+// Package
+// Packed
+// PanelData
+// ParamGiftExpert
+// ParamHeroInteraction
+// ParamPartin
+// ParamReward
+// ParamShopping
+// ParamSocial
+// Parameter
+// ParticleCount
+// Patch
+// Path
+// Paths
+// PhpClassPrefix
+// PhpGenericServices
+// PhpMetadataNamespace
+// PhpNamespace
+// PhyArmorHurt
+// PhyAtk
+// PhyDamagePercent
+// PhyDef
+// PhyVamp
+// PlatId
+// PlayerRuntimeId
+// PositiveIntValue
+// PrebuyEquipId
+// Proto3Optional
+// ProtoFile
+// PublicDependency
+// PyGenericServices
+// QaData
+// QueryRecommand
+// Querys
+// Question
+// QuestionnaireData
+// Ratio
+// RecommandEquip
+// Repeated
+// RequestId
+// RequestStreaming
+// RequestTypeUrl
+// Reserved
+// ReservedName
+// ReservedRange
+// ResponseId
+// ResponseStreaming
+// ResponseTypeUrl
+// Result
+// Retention
+// ReviveTime
+// RewardId
+// RightInteractionBtnText
+// RightInteractionSignalText
+// RoleId
+// RoleLevel
+// Root
+// RubyPackage
+// RuntimeId
+// Scene
+// SceneType
+// Season
+// Seconds
+// SeenDead
+// Semantic
+// SequenceNo
+// SerialNo
+// ServerStreaming
+// Service
+// SettingData
+// SettingType
+// SettingValue
+// SgameId
+// SignalData
+// SignalId
+// SignalInfoData
+// SkillSlotsDamage
+// Skills
+// SkilluseRecord
+// SkinId
+// SlotSkillId
+// SlotType
+// SoldierBrach
+// SoldierLine
+// SoldierUpdates
+// SoliderType
+// SourceCodeInfo
+// SourceContext
+// SourceFile
+// Span
+// Stars
+// Start
+// States
+// StringValue
+// StructValue
+// Style
+// Subgoal
+// Suffix
+// SupportedFeatures
+// SwiftPrefix
+// SyncType
+// Syntax
+// TakeHurtInfos
+// TargetCamp
+// TargetConfigId
+// Target
+// TargetPosX
+// TargetPosZ
+// TargetRuntimeId
+// Targets
+// Temperature
+// TextContent
+// Text
+// Timbre
+// Timestamp
+// TodayOnlineTime
+// TodayUseCnt
+// TotalControlMs
+// TotalDamage
+// TotalDamagePercent
+// TotalDamageReceived
+// TraceId
+// TrailingComments
+// TriggerData
+// Tris
+// TrueDamagePercent
+// TtsTokens
+// Type
+// TypeName
+// TypeUrl
+// Uid
+// UninterpretedOption
+// UnverifiedLazy
+// UsedLingbaoSkinId
+// UsedLingbaoSkinName
+// UserExtraInfo
+// Value
+// Values
+// Verification
+// Version
+// VictimId
+// VictimRuntimeId
+// ViolationNum
+// VoiceData
+// VoiceFileId
+// VoiceInfo
+// VoiceType
+// WakeUpData
+// WeakDependency
+// Weak
+// Weather
+// WildcardType
+// WildcardTypeLeftSignalText
+// WildcardTypeRightSignalText
+// WrapperValue
+// X
+// XIAOZHUZAI
+// Y
+// YUANGUBAOJUN
+// YellowPoint
+// Z
+// get_
+// last

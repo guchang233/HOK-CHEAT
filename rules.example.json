@@ -1,0 +1,17 @@
+{
+  "_说明": [
+    "先用 scan 子命令生成报告，把下面 find 替换成你 APK 里实际命中的字符串",
+    "文本文件(json/xml/ini)可自由长度替换；.so 一律等长替换（不足自动 NUL 填充，超长报错）",
+    "file_overrides 可整文件替换（左边=APK内条目路径，右边=本地文件路径）",
+    "私服地址尽量短于原官方域名，如 192.168.x.x / 内网域名"
+  ],
+  "replacements": [
+    { "path": "assets/Config/ServerConfig.json", "find": "battle.qq.com:6645", "replace": "192.168.1.10:6645" },
+    { "path": "assets/version.ini", "find": "https://version.qq.com/check", "replace": "http://192.168.1.10:8080/check" },
+    { "path_glob": "lib/arm64-v8a/*.so", "find": "tcp://battle.qq.com:6645", "replace": "tcp://192.168.1.10:6645" },
+    { "path_glob": "lib/arm64-v8a/*.so", "find": "sgame_gateway.qq.com", "replace": "192.168.1.10" }
+  ],
+  "file_overrides": {
+    "assets/Config/GameModeConfig.json": "local_overrides/GameModeConfig.json"
+  }
+}

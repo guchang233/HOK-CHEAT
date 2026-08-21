@@ -1,0 +1,131 @@
+{
+  "replacements": [
+    {
+      "path": "assets/Config/ServerConfig.json",
+      "find": "https://sgame_gateway.qq.com:8080/serverlist",
+      "replace": "https://127.0.0.1:6645/serverlist",
+      "binary": false
+    },
+    {
+      "path": "assets/Config/ServerConfig.json",
+      "find": "tcp://battle.qq.com:6645",
+      "replace": "tcp://127.0.0.1:6645",
+      "binary": false
+    },
+    {
+      "path": "assets/Config/ServerConfig.json",
+      "find": "tcp://match.qq.com:5555",
+      "replace": "tcp://127.0.0.1:6645",
+      "binary": false
+    },
+    {
+      "path": "assets/Config/ServerConfig.json",
+      "find": "https://dliir.path.qq.com/hok/res/",
+      "replace": "https://127.0.0.1:6645/hok/res/",
+      "binary": false
+    },
+    {
+      "path": "assets/Config/ServerConfig.json",
+      "find": "https://version.qq.com/check",
+      "replace": "https://127.0.0.1:6645/check",
+      "binary": false
+    },
+    {
+      "path": "assets/version.ini",
+      "find": "https://version.qq.com/check",
+      "replace": "https://127.0.0.1:6645/check",
+      "binary": false
+    },
+    {
+      "path": "assets/version.ini",
+      "find": "https://dliir.path.qq.com/hok/res/",
+      "replace": "https://127.0.0.1:6645/hok/res/",
+      "binary": false
+    },
+    {
+      "path": "assets/webview/index.html",
+      "find": "https://sgame.qq.com/activity",
+      "replace": "https://127.0.0.1:6645/activi",
+      "binary": false
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "battle.qq.com",
+      "replace": "127.0.0.1:664",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "5match.qq.com",
+      "replace": "127.0.0.1:664",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "dliir.path.qq.com",
+      "replace": "127.0.0.1:6645",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "version.qq.com",
+      "replace": "127.0.0.1:6645",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "api.tencent.com",
+      "replace": "127.0.0.1:6645",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "social.qq.com",
+      "replace": "127.0.0.1:664",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "cdndownload.qq.com",
+      "replace": "127.0.0.1:6645",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libGameCore.so",
+      "find": "cfs.qq.com",
+      "replace": "127.0.0.1:",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libtprt.so",
+      "find": "https://tpp.qq.com/check",
+      "replace": "https://127.0.0.1:6645/c",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libtprt.so",
+      "find": "secure.qq.com",
+      "replace": "127.0.0.1:664",
+      "binary": true
+    },
+    {
+      "path": "lib/arm64-v8a/libtprt.so",
+      "find": "tpp.qq.com",
+      "replace": "127.0.0.1:",
+      "binary": true
+    },
+    {
+      "path": "assets/META-INF/AIR/application.xml",
+      "find": "http://ns.adobe.com/air/application/24.0",
+      "replace": "http://127.0.0.1:6645/air/application/24",
+      "binary": false
+    },
+    {
+      "path": "lib/arm64-v8a/libapollo.so",
+      "find": "https://apollo.qq.com/config",
+      "replace": "https://127.0.0.1:6645/confi",
+      "binary": true
+    }
+  ],
+  "file_overrides": {}
+}

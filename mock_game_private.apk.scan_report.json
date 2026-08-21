@@ -1,0 +1,121 @@
+{
+  "assets/Config/ServerConfig.json": [
+    {
+      "type": "url",
+      "original": "https://sgame_gateway.qq.com:8080/serverlist",
+      "offset": 36
+    },
+    {
+      "type": "url",
+      "original": "tcp://battle.qq.com:6645",
+      "offset": 102
+    },
+    {
+      "type": "url",
+      "original": "tcp://match.qq.com:5555",
+      "offset": 147
+    },
+    {
+      "type": "url",
+      "original": "https://dliir.path.qq.com/hok/res/",
+      "offset": 191
+    },
+    {
+      "type": "url",
+      "original": "https://version.qq.com/check",
+      "offset": 244
+    }
+  ],
+  "assets/version.ini": [
+    {
+      "type": "url",
+      "original": "https://version.qq.com/check",
+      "offset": 54
+    },
+    {
+      "type": "url",
+      "original": "https://dliir.path.qq.com/hok/res/",
+      "offset": 94
+    }
+  ],
+  "assets/webview/index.html": [
+    {
+      "type": "url",
+      "original": "https://sgame.qq.com/activity",
+      "offset": 25
+    }
+  ],
+  "lib/arm64-v8a/libGameCore.so": [
+    {
+      "type": "domain",
+      "original": "battle.qq.com",
+      "offset": 217088
+    },
+    {
+      "type": "domain",
+      "original": "5match.qq.com",
+      "offset": 217343
+    },
+    {
+      "type": "domain",
+      "original": "dliir.path.qq.com",
+      "offset": 217856
+    },
+    {
+      "type": "domain",
+      "original": "version.qq.com",
+      "offset": 218112
+    },
+    {
+      "type": "domain",
+      "original": "api.tencent.com",
+      "offset": 218368
+    },
+    {
+      "type": "domain",
+      "original": "social.qq.com",
+      "offset": 218624
+    },
+    {
+      "type": "domain",
+      "original": "cdndownload.qq.com",
+      "offset": 218880
+    },
+    {
+      "type": "domain",
+      "original": "cfs.qq.com",
+      "offset": 219136
+    }
+  ],
+  "lib/arm64-v8a/libtprt.so": [
+    {
+      "type": "url",
+      "original": "https://tpp.qq.com/check",
+      "offset": 20992
+    },
+    {
+      "type": "domain",
+      "original": "secure.qq.com",
+      "offset": 20480
+    },
+    {
+      "type": "domain",
+      "original": "tpp.qq.com",
+      "offset": 20736
+    }
+  ],
+  "assets/META-INF/AIR/application.xml": [
+    {
+      "type": "url",
+      "original": "http://ns.adobe.com/air/application/24.0",
+      "offset": 20
+    }
+  ],
+  "lib/arm64-v8a/libapollo.so": [
+    {
+      "type": "url",
+      "original": "https://apollo.qq.com/config",
+      "offset": 4
+    }
+  ]
+}

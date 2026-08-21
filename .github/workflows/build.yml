@@ -1,0 +1,134 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: '官方 APK 直链 URL (可选; 留空则仅跑管线验证)'
+        required: false
+        default: ''
+      server:
+        description: '私服地址 host:port'
+        required: false
+        default: '127.0.0.1:6645'
+
+env:
+  R8_JAR: ${{ github.workspace }}/.tools/r8.jar
+  NDK_VERSION: 26.3.11579264
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install \
+            "build-tools;34.0.0" \
+            "platforms;android-34" \
+            "ndk;${NDK_VERSION}" > /dev/null
+          echo "--- installed ---"
+          ls "$ANDROID_HOME/build-tools" "$ANDROID_HOME/platforms" "$ANDROID_HOME/ndk"
+
+      - name: Download r8
+        run: |
+          mkdir -p .tools
+          curl -fSL --retry 3 -o "$R8_JAR" \
+            https://storage.googleapis.com/r8-releases/raw/8.5.35/r8.jar
+          ls -la "$R8_JAR"
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --user cryptography \
+            || python3 -m pip install --break-system-packages cryptography
+
+      # ============================================================
+      #  阶段 1: 管线验证 (合成 APK, 每次 push 必跑)
+      #  aapt2/dexdump/apksigner/NDK 全链路 + 注入 + 签名校验
+      # ============================================================
+      - name: E2E pipeline validation (synthetic APK)
+        run: python3 e2e_test.py
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+
+      - name: Upload E2E validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-validation-${{ github.run_number }}
+          path: build_e2e/output/deploy/
+          if-no-files-found: warn
+
+      # ============================================================
+      #  阶段 2: 真实 APK 构建 (workflow_dispatch 输入 apk_url
+      #          或仓库 secret OFFICIAL_APK_URL 提供时执行)
+      # ============================================================
+      - name: Resolve APK source
+        id: apksrc
+        run: |
+          if [ -n "${{ github.event.inputs.apk_url }}" ]; then
+            echo "url=${{ github.event.inputs.apk_url }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ secrets.OFFICIAL_APK_URL }}" ]; then
+            echo "url=${{ secrets.OFFICIAL_APK_URL }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=" >> "$GITHUB_OUTPUT"
+            echo "[*] 未提供 APK 来源, 跳过真实构建 (仅验证)"
+          fi
+
+      - name: Restore signing keys (optional)
+        if: ${{ secrets.SIGNING_KEY_B64 != '' && secrets.SIGNING_CERT_B64 != '' }}
+        run: |
+          mkdir -p keys
+          printf '%s' "${{ secrets.SIGNING_KEY_B64 }}" | base64 -d > keys/key.pem
+          printf '%s' "${{ secrets.SIGNING_CERT_B64 }}" | base64 -d > keys/cert.pem
+          echo "[✓] 签名密钥已从 secrets 恢复 (签名身份稳定)"
+
+      - name: Download official APK
+        if: steps.apksrc.outputs.url != ''
+        run: |
+          curl -fSL --retry 3 -A "Mozilla/5.0" -o official.apk "${{ steps.apksrc.outputs.url }}"
+          ls -la official.apk
+          file official.apk || true
+
+      - name: Build all-in-one embedded APK
+        if: steps.apksrc.outputs.url != ''
+        run: |
+          python3 ultimate_builder.py official.apk \
+            --server "${{ github.event.inputs.server || '127.0.0.1:6645' }}" \
+            -o output --force
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+
+      - name: Upload deploy bundle
+        if: steps.apksrc.outputs.url != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: hok-embedded-${{ github.run_number }}
+          path: |
+            output/deploy/*.apk
+            output/deploy/install.sh
+            output/deploy/README.txt
+          if-no-files-found: error
+
+      - name: Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/') && steps.apksrc.outputs.url != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            output/deploy/*.apk
+          generate_release_notes: true
