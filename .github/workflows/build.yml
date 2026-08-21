@@ -138,7 +138,7 @@ jobs:
         with:
           name: hok-embedded-${{ github.run_number }}
           path: |
-            output/deploy/*.apk
+            output/deploy/game_embedded.apk
             output/deploy/install.sh
             output/deploy/README.txt
           if-no-files-found: error
