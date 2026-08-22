@@ -298,12 +298,12 @@ def main():
         shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
 
-    print("\n== 1/3 构造合成游戏 APK (aapt2 + javac + d8) ==")
+    print("\n== 1/5 构造合成游戏 APK (aapt2 + javac + d8) ==")
     game_apk = build_synthetic_apk(WORK / "synthetic_game.apk")
     print(f"  合成 APK: {game_apk} ({game_apk.stat().st_size:,} bytes)")
     check("合成 APK 构建成功", game_apk.exists() and game_apk.stat().st_size > 100_000)
 
-    print("\n== 2/3 运行 ultimate_builder.py (私服 + ESP 内置) ==")
+    print("\n== 2/5 运行 ultimate_builder.py (私服 + ESP 内置) ==")
     out_dir = WORK / "output"
     env = os.environ.copy()
     r = subprocess.run([sys.executable, str(UB), str(game_apk),
@@ -314,7 +314,7 @@ def main():
         print(r.stderr[-2000:])
     check("ultimate_builder 全流程退出码 0", r.returncode == 0)
 
-    print("\n== 3/3 校验产物 ==")
+    print("\n== 3/5 校验产物 ==")
     embedded = out_dir / "deploy" / "game_embedded.apk"
     check("game_embedded.apk 已产出", embedded.exists(),
           f"{embedded.stat().st_size:,} bytes" if embedded.exists() else "")
@@ -345,6 +345,40 @@ def main():
               f"e_machine={machine}")
     else:
         check("tv_reader x86_64 已构建 (模拟器用)", False, "产物不存在")
+
+    # ---- 分体模式: overlay APK (Gradle + Kotlin 全量编译) ----
+    print("\n== 4/5 分体模式构建 (--skip-embed --with-overlay) ==")
+    out_dir2 = WORK / "output_overlay"
+    r = subprocess.run([sys.executable, str(UB), str(game_apk),
+                        "--server", SERVER, "-o", str(out_dir2), "--force",
+                        "--skip-embed", "--with-overlay"],
+                       env=env, capture_output=True, text=True, timeout=1800)
+    print((r.stdout or "")[-2500:])
+    if r.returncode != 0:
+        print(r.stderr[-2000:])
+    check("分体模式退出码 0", r.returncode == 0)
+
+    print("\n== 5/5 校验 overlay 产物 ==")
+    overlay = out_dir2 / "deploy" / "esp_overlay.apk"
+    check("esp_overlay.apk 已产出", overlay.exists(),
+          f"{overlay.stat().st_size:,} bytes" if overlay.exists() else "")
+    if overlay.exists():
+        with zipfile.ZipFile(overlay) as zf:
+            names = zf.namelist()
+            a64 = "assets/native/tv_reader_arm64"
+            x64 = "assets/native/tv_reader_x64"
+            check("overlay 含 arm64 tv_reader", a64 in names)
+            check("overlay 含 x86_64 tv_reader (模拟器)", x64 in names)
+            for n in (a64, x64):
+                if n in names:
+                    data = zf.read(n)
+                    check(f"{n} 为 ELF", data[:4] == b'\x7fELF',
+                          f"{len(data):,} bytes")
+            check("overlay 含 MainActivity dex",
+                  any(n.startswith("classes") and n.endswith(".dex")
+                      for n in names))
+    check("分体模式游戏包已产出 (game_private.apk)",
+          (out_dir2 / "deploy" / "game_private.apk").exists())
 
     # ---- 汇总 ----
     n_pass = sum(1 for _, ok in results if ok)

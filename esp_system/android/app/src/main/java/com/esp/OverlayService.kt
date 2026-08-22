@@ -236,9 +236,9 @@ class OverlayService : Service() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.argb(230, 15, 15, 20))
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            layoutParams = android.widget.ScrollView.LayoutParams(
-                android.widget.ScrollView.LayoutParams.MATCH_PARENT,
-                android.widget.ScrollView.LayoutParams.WRAP_CONTENT
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
             )
         }
 

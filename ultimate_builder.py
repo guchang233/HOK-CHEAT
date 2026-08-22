@@ -1073,12 +1073,16 @@ def main():
             # ---- Step 5d: 独立 ESP Overlay APK (分体模式, 可选) ----
             if args.with_overlay:
                 if not tv_bins:
-                    warn("tv_reader 不可用，跳过独立 ESP Overlay APK")
-                else:
-                    esp_apk_path = build_esp_overlay_apk(
-                        sdk, tv_bins, out_dir,
-                        args.game_pkg, args.port
-                    )
+                    fail("tv_reader 不可用 (--with-overlay 显式要求 overlay, 直接失败)")
+                    sys.exit(1)
+                esp_apk_path = build_esp_overlay_apk(
+                    sdk, tv_bins, out_dir,
+                    args.game_pkg, args.port
+                )
+                if esp_apk_path is None:
+                    # 显式要求 overlay 却没产出 → 硬失败, 避免部署包静默缺文件
+                    fail("ESP Overlay APK 构建失败 (--with-overlay 显式要求)")
+                    sys.exit(1)
     else:
         section("Step 5/6  跳过 ESP 构建 (--skip-esp)")
 
