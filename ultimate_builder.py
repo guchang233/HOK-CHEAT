@@ -395,32 +395,145 @@ def build_tv_reader_host(out_dir: Path) -> Path | None:
         return out_bin
     return None
 
-def build_esp_inject_dex(out_dir: Path) -> Path | None:
-    """构建 ESP 注入 dex (javac + d8, 无需 Gradle/SDK)"""
-    section("Step 5b  构建 ESP 注入 dex (javac + d8)")
+# ---- ESP dex 混淆映射 (对抗 TP 启动期 dex 内容扫描) ----
+# 探针实测: 注入原始 dex → 启动 1.2s 被 SIGKILL; 仅加 assets → 正常。
+# 故 dex 内不得残留任何 cheat 特征字样 (类名/字符串/标识符)。
+OBF_PROVIDER = "com.gs.GsProvider"
+OBF_SERVICE = "com.gs.GsService"
+OBF_ASSET_ARM64 = "assets/native/gsvc_arm64"
+OBF_ASSET_V7A = "assets/native/gsvc_v7a"
 
-    script = INJECT_DIR / "build_inject_dex.py"
-    if not script.exists():
-        fail(f"构建脚本缺失: {script}")
-        return None
+# 顺序敏感: 先长串/具体, 后短串/泛化
+_OBF_REPLACEMENTS = [
+    # 游戏包名常量删除, 调用点改运行时获取 (dex 不留包名字符串)
+    ('    public static final String GAME_PKG_DEFAULT = "com.tencent.tmgp.sgame";\n',
+     ''),
+    ('RootHelper.GAME_PKG_DEFAULT', 'getPackageName()'),
+    # 运行时路径 / 二进制名 / 资产路径
+    ('/data/adb/esp', '/data/local/tmp/.gs'),
+    ('tv_reader', 'gsvc'),
+    ('esp_native/', 'native/'),
+    ('esp_overlay', 'gs_panel'),
+    # 类与包名
+    ('com.esp', 'com.gs'),
+    ('com/esp', 'com/gs'),
+    ('EspInjectProvider', 'GsProvider'),
+    ('EspCanvasView', 'GsCanvasView'),
+    ('EspFrame', 'GsFrame'),
+    ('OverlayService', 'GsService'),
+    ('RootHelper', 'GsOps'),
+    ('ReaderClient', 'GsNet'),
+    # 残留特征字样 (TAG / UI 文案 / 标识符)
+    ('ESP-', 'GS-'),
+    ('ESP', 'GS'),
+    ('Esp', 'Gs'),
+    ('esp', 'gs'),
+    ('READER', 'SVC'),
+    ('Reader', 'Svc'),
+    ('reader', 'svc'),
+    # inject 字样 (日志 TAG/文案) → 中性 init
+    ('Inject', 'Init'),
+    ('inject', 'init'),
+]
+_OBF_FILE_RENAMES = {
+    'EspInjectProvider.java': 'GsProvider.java',
+    'OverlayService.java': 'GsService.java',
+    'EspCanvasView.java': 'GsCanvasView.java',
+    'EspFrame.java': 'GsFrame.java',
+    'RootHelper.java': 'GsOps.java',
+    'ReaderClient.java': 'GsNet.java',
+}
+# 混淆后 dex 字节里禁止出现的特征串 (小写匹配由 MUTF-8 直接子串判定)
+_FORBIDDEN_IN_DEX = [b'esp', b'Esp', b'ESP', b'tv_reader', b'/data/adb',
+                     b'tmgp.sgame', b'cheat', b'hack', b'inject']
 
-    r = run([sys.executable, str(script)], capture=True)
+
+def _obfuscate_sources(src_dir: Path, out_dir: Path) -> list:
+    """拷贝并混淆 Java 源码树 → out_dir; 返回 java 文件路径列表"""
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    java_files = []
+    for p in sorted(src_dir.rglob("*.java")):
+        txt = p.read_text(encoding="utf-8")
+        for old, new in _OBF_REPLACEMENTS:
+            txt = txt.replace(old, new)
+        rel = p.relative_to(src_dir)                      # com/esp/Xxx.java
+        rel = Path(*[('gs' if part == 'esp' else part) for part in rel.parts])
+        new_name = _OBF_FILE_RENAMES.get(rel.name, rel.name)
+        dst = out_dir / rel.parent / new_name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(txt, encoding="utf-8")
+        java_files.append(dst)
+    return java_files
+
+
+def _compile_dex(java_files: list, out_dir: Path, min_api: int = 24) -> Path:
+    """javac + d8 → out_dir/classes.dex (复用 build_inject_dex 工具探测)"""
+    sys.path.insert(0, str(INJECT_DIR))
+    import build_inject_dex as bid
+    jar = bid.find_android_jar()
+    d8 = bid.find_d8()
+
+    classes = out_dir / "classes"
+    if classes.exists():
+        shutil.rmtree(classes)
+    classes.mkdir(parents=True)
+    # -parameters: JDK21+ javac 对匿名类 mandated 参数发无名 MethodParameters,
+    # 旧 d8 (build-tools 34) 会 NPE; 显式 -parameters 让所有参数具名即可规避
+    r = run(["javac", "--release", "8", "-nowarn", "-parameters", "-cp", jar,
+             "-d", str(classes)] + [str(f) for f in java_files], capture=True)
     if r.returncode != 0:
-        fail("ESP 注入 dex 构建失败")
-        if r.stdout: print(r.stdout[-600:])
-        if r.stderr: print(r.stderr[-400:])
+        fail("javac 编译混淆源码失败")
+        if r.stdout: print(r.stdout[-800:])
+        if r.stderr: print(r.stderr[-800:])
         return None
 
-    # 输出里的统计行
-    for line in (r.stdout or "").splitlines():
-        if line.startswith("[✓]") or line.startswith("[*] DEX"):
-            info("  " + line)
-
-    if not INJECT_DEX.exists():
-        fail(f"未产出 dex: {INJECT_DEX}")
+    dex_dir = out_dir / "dex"
+    if dex_dir.exists():
+        shutil.rmtree(dex_dir)
+    dex_dir.mkdir(parents=True)
+    class_files = sorted(classes.rglob("*.class"))
+    r = run(d8 + ["--release", "--lib", jar, "--min-api", str(min_api),
+                  "--output", str(dex_dir)] + [str(f) for f in class_files],
+            capture=True)
+    if r.returncode != 0:
+        fail("d8 转换失败")
+        if r.stdout: print(r.stdout[-800:])
+        if r.stderr: print(r.stderr[-800:])
         return None
-    ok(f"注入 dex → {INJECT_DEX} ({INJECT_DEX.stat().st_size:,} bytes)")
-    return INJECT_DEX
+    dex = dex_dir / "classes.dex"
+    return dex if dex.exists() else None
+
+
+def build_esp_inject_dex(out_dir: Path) -> Path | None:
+    """构建混淆版 ESP 注入 dex (源码特征清洗 → javac + d8)"""
+    section("Step 5b  构建 ESP 注入 dex (混淆: 类名/字符串/路径中性化)")
+
+    src = INJECT_DIR / "src"
+    if not src.exists():
+        fail(f"注入源码缺失: {src}")
+        return None
+
+    obf_dir = out_dir / "obf_build"
+    java_files = _obfuscate_sources(src, obf_dir / "src")
+    if not java_files:
+        fail("混淆源码为空")
+        return None
+    info(f"混淆源码: {len(java_files)} 个文件 → com.gs.*")
+
+    dex = _compile_dex(java_files, obf_dir)
+    if dex is None:
+        return None
+
+    # 特征串自检: dex 字节级扫描, 任何残留直接判失败
+    data = dex.read_bytes()
+    leaked = [s.decode() for s in _FORBIDDEN_IN_DEX if s in data]
+    if leaked:
+        fail(f"混淆后 dex 仍含特征串: {leaked}")
+        return None
+    ok(f"特征串自检通过 (esp/tv_reader/tmgp.sgame 等均未残留)")
+    ok(f"注入 dex → {dex} ({dex.stat().st_size:,} bytes)")
+    return dex
 
 
 def embed_esp_into_apk(
@@ -436,16 +549,22 @@ def embed_esp_into_apk(
         tv_reader_arm64=tv_bins.get("arm64_v8a"),
         tv_reader_v7a=tv_bins.get("armeabi_v7a"),
         keys_dir=keys_dir,
+        provider_class=OBF_PROVIDER,
+        service_class=OBF_SERVICE,
+        asset_arm64_name=OBF_ASSET_ARM64,
+        asset_v7a_name=OBF_ASSET_V7A,
+        authorities=f"{game_pkg}.gs.c1",
     )
     if report is None:
         fail("注入失败")
         return None
 
     # 官方工具链校验
-    if not apk_injector.verify_with_aapt2(out_apk):
+    if not apk_injector.verify_with_aapt2(out_apk, provider_name="GsProvider",
+                                          service_name="GsService"):
         fail("aapt2 校验注入后的 manifest 失败")
         return None
-    ok("aapt2 manifest 校验通过 (provider + service + 权限)")
+    ok("aapt2 manifest 校验通过 (GsProvider + GsService + 权限)")
 
     if not apk_injector.verify_with_apksigner(out_apk):
         fail("apksigner 签名校验失败")
@@ -462,38 +581,72 @@ def embed_esp_into_apk(
     return final
 
 
+def _build_harmless_dex(out_dir: Path) -> Path | None:
+    """构建无害探针 dex (一个纯 Java 工具类, 无任何 Android/悬浮窗/root API)"""
+    tiny_src = out_dir / "tiny_build" / "src"
+    pkg_dir = tiny_src / "com" / "gs" / "core"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "Holder.java").write_text(
+        'package com.gs.core;\n'
+        'public class Holder {\n'
+        '    public static String v() { return "1.0.2"; }\n'
+        '    public static int i(int a) { return a + 7; }\n'
+        '}\n', encoding="utf-8")
+    return _compile_dex(sorted(tiny_src.rglob("*.java")), out_dir / "tiny_build")
+
+
 def build_probe_apks(game_apk: Path, dex: Path, tv_bins: dict,
-                     out_dir: Path, keys_dir: Path) -> list:
-    """TP 反作弊检测点探针变体 (定位被检测的注入项):
-      game_test_dexonly.apk    — 仅追加 classesN.dex (不动 manifest/assets, ESP 不运行)
-      game_test_assetsonly.apk — 仅追加 assets tv_reader (不动 manifest/dex)
-    判定: 能进游戏 = 该项不被检测; 启动即被杀(SIGKILL) = TP 检测该项。"""
-    section("Step 5e  TP 检测探针变体 (dex-only / assets-only)")
-    arm64 = tv_bins.get("arm64_v8a")
-    specs = [
-        ("game_test_dexonly.apk", dict(inject_manifest=False, include_dex=True,
-                                       include_assets=False), False),
-        ("game_test_assetsonly.apk", dict(inject_manifest=False, include_dex=False,
-                                          include_assets=True), True),
-    ]
+                     out_dir: Path, keys_dir: Path, game_pkg: str = "") -> list:
+    """TP 反作弊检测点探针 (上轮结论: assets 不检测, dex 被扫描):
+      game_test_hdex.apk — 仅追加无害 classesN.dex, 不动 manifest/assets
+                           → 判定 TP 检测的是 dex 文件存在性还是内容
+      game_test_mfo.apk  — 仅改 manifest (权限 + service + 禁用 provider),
+                           无 dex/assets → 判定 manifest 结构是否被检测
+    判定: 能进游戏 = 不被检测; 启动白屏/被杀 = 检测该项。"""
+    section("Step 5e  TP 检测探针变体 (harmless-dex / manifest-only)")
+
     probes = []
-    for name, kw, with_assets in specs:
-        info(f"构建探针: {name} ...")
-        out_apk = out_dir / name.replace(".apk", "_unsigned.apk")
+
+    # ---- 探针 1: 无害 dex ----
+    info("构建探针: game_test_hdex.apk (仅追加无害 dex)...")
+    hdex = _build_harmless_dex(out_dir)
+    if hdex is None:
+        warn("无害 dex 构建失败, 跳过 hdex 探针")
+    else:
+        out_apk = out_dir / "game_test_hdex_unsigned.apk"
         rep = apk_injector.inject_esp_into_apk(
-            game_apk, out_apk, dex,
-            tv_reader_arm64=arm64 if with_assets else None,
-            keys_dir=keys_dir, **kw)
-        if rep is None:
-            warn(f"探针 {name} 注入失败")
-            continue
-        if not apk_injector.verify_with_apksigner(out_apk):
-            warn(f"探针 {name} 签名校验失败")
-            continue
-        final = out_dir / name
+            game_apk, out_apk, hdex,
+            keys_dir=keys_dir,
+            inject_manifest=False, include_dex=True, include_assets=False)
+        if rep and apk_injector.verify_with_apksigner(out_apk):
+            final = out_dir / "game_test_hdex.apk"
+            shutil.move(str(out_apk), final)
+            ok(f"探针 → {final} ({final.stat().st_size:,} bytes)")
+            probes.append(final)
+        else:
+            warn("hdex 探针构建/签名失败")
+
+    # ---- 探针 2: manifest-only (provider 禁用 → 不会被实例化, 无需 dex) ----
+    info("构建探针: game_test_mfo.apk (仅改 manifest)...")
+    out_apk = out_dir / "game_test_mfo_unsigned.apk"
+    rep = apk_injector.inject_esp_into_apk(
+        game_apk, out_apk, dex,
+        keys_dir=keys_dir,
+        inject_manifest=True, include_dex=False, include_assets=False,
+        provider_enabled=False,
+        provider_class=OBF_PROVIDER, service_class=OBF_SERVICE,
+        authorities=f"{game_pkg or 'unknown.pkg'}.gs.c1",
+    )
+    if (rep and apk_injector.verify_with_aapt2(out_apk, provider_name="GsProvider",
+                                               service_name="GsService")
+            and apk_injector.verify_with_apksigner(out_apk)):
+        final = out_dir / "game_test_mfo.apk"
         shutil.move(str(out_apk), final)
         ok(f"探针 → {final} ({final.stat().st_size:,} bytes)")
         probes.append(final)
+    else:
+        warn("mfo 探针构建/签名失败")
+
     return probes
 
 
@@ -710,16 +863,16 @@ ESP 使用 (内置版):
   - 需要 Root 权限 (Magisk / KernelSU)
   - 首次启动 ESP 时需要授予 Root 权限
   - 确保游戏已登录进入大厅后 ESP 才会有数据
-  - 若 ESP 无显示，检查 tv_reader 日志:
-    adb shell "su -c 'tail -50 /data/adb/esp/tv_reader.log'"
+  - 若 ESP 无显示，检查 reader 日志:
+    adb shell "su -c 'tail -50 /data/local/tmp/.gs/gsvc.log'"
 
-TP 反作弊检测探针 (游戏内置版被杀时用于定位检测项):
-  game_test_dexonly.apk    — 仅多一个 classesN.dex, 不改 manifest/assets
-  game_test_assetsonly.apk — 仅多 assets/tv_reader, 不改 manifest/dex
-  逐个安装并启动游戏:
-    能进游戏  → 该项不被 TP 检测
-    启动几秒后被杀/白屏 → TP 检测该项
-  两个都能进游戏 → 检测点在 manifest 组件 (provider/service)
+TP 反作弊检测探针 (定位检测项, 逐个安装测试):
+  game_test_hdex.apk — 仅追加无害 classesN.dex (不动 manifest/assets)
+    能进游戏 → TP 扫描 dex 内容而非文件数 → game_embedded 混淆有效
+    被杀     → TP 检测 dex 文件存在 → 单包内置不可行, 用分体模式
+  game_test_mfo.apk  — 仅改 manifest (权限+service+禁用provider, 无 dex)
+    能进游戏 → manifest 结构不被检测
+    被杀     → TP 校验 manifest → 单包内置不可行, 用分体模式
 ''', encoding='utf-8')
 
     ok(f"部署包 → {deploy_dir}/")
@@ -851,8 +1004,16 @@ def main():
             if ndk:
                 tv_bins = build_tv_reader_ndk(ndk, sdk, out_dir)
             else:
-                warn("NDK 不可用，跳过原生二进制编译")
+                warn("NDK 不可用，尝试复用历史构建产物")
                 p(C.Y, "    请安装 NDK: sdkmanager 'ndk;25.2.9519653'")
+                # 本地无 NDK 时回退: 复用上次构建的二进制 (源码未变时安全)
+                for abi, sub in (("arm64_v8a", "ndk_arm64"), ("armeabi_v7a", "ndk_v7a")):
+                    prev = ROOT / "build_ultimate" / sub / "tv_reader"
+                    if prev.exists():
+                        tv_bins[abi] = prev
+                        info(f"  复用 {prev}")
+                if not tv_bins:
+                    warn("无历史 tv_reader 产物，跳过原生二进制")
 
             # ---- Step 5b + 5c: 注入 dex → 内置注入 (单一直装包) ----
             if not args.skip_embed:
@@ -870,7 +1031,8 @@ def main():
                         warn("ESP 内置注入失败，仅保留分体模式产物")
                     else:
                         probe_apks = build_probe_apks(
-                            signed_apk, inject_dex, tv_bins, out_dir, keys_dir)
+                            signed_apk, inject_dex, tv_bins, out_dir, keys_dir,
+                            args.game_pkg)
             else:
                 section("Step 5b-5c  跳过 ESP 内置注入 (--skip-embed)")
 

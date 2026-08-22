@@ -277,8 +277,9 @@ class AxmlDocument:
         self._sync_resource_map()
         return True
 
-    def add_provider(self, class_name: str, authorities: str) -> bool:
-        """在 <application> 下添加 provider"""
+    def add_provider(self, class_name: str, authorities: str,
+                     enabled: bool = True) -> bool:
+        """在 <application> 下添加 provider (enabled=False 时不被实例化)"""
         app = self.find_child(self.root, "application")
         if app is None:
             raise AxmlError("未找到 <application> 元素")
@@ -302,11 +303,11 @@ class AxmlDocument:
         elem.attrs.append(Attribute(
             ns_idx, self.ensure_string("exported"),
             false_idx, TYPE_INT_BOOLEAN, 0))
-        # enabled=true
-        true_idx = self.ensure_string("true")
+        # enabled 布尔
+        bool_idx = self.ensure_string("true" if enabled else "false")
         elem.attrs.append(Attribute(
             ns_idx, self.ensure_string("enabled"),
-            true_idx, TYPE_INT_BOOLEAN, 0xFFFFFFFF))
+            bool_idx, TYPE_INT_BOOLEAN, 0xFFFFFFFF if enabled else 0))
 
         # provider 放在 application 子元素末尾 (activity 之前也可, 顺序无碍)
         app.children.append(elem)
@@ -504,13 +505,16 @@ def _read_uvarint(data: bytes, pos: int) -> Tuple[int, int]:
 
 def inject_esp_into_manifest(
     manifest_bytes: bytes,
-    provider_class: str,
-    authorities: str,
+    provider_class: Optional[str],
+    authorities: Optional[str],
     service_class: Optional[str] = None,
     extra_permissions: Optional[List[str]] = None,
+    provider_enabled: bool = True,
 ) -> Tuple[bytes, dict]:
     """
     注入 ESP 组件到 AndroidManifest.xml
+    provider_class=None 时只注入权限/服务 (探针用);
+    provider_enabled=False 时 provider 声明但禁用 (不会被实例化)。
 
     返回 (新 manifest 字节, 注入报告 dict)
     """
@@ -534,8 +538,10 @@ def inject_esp_into_manifest(
         if doc.add_uses_permission(p):
             report["permissions"].append(p)
 
-    if doc.add_provider(provider_class, authorities):
-        report["provider"] = True
+    if provider_class:
+        if doc.add_provider(provider_class, authorities, enabled=provider_enabled):
+            report["provider"] = True
+            report["provider_enabled"] = provider_enabled
 
     if service_class:
         if doc.add_service(service_class, foreground_service_type="specialUse"):

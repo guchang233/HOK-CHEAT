@@ -67,11 +67,18 @@ def inject_esp_into_apk(
     inject_manifest: bool = True,
     include_dex: bool = True,
     include_assets: bool = True,
+    provider_enabled: bool = True,
+    asset_arm64_name: str = ASSET_ARM64,
+    asset_v7a_name: str = ASSET_V7A,
+    authorities: str = None,
 ) -> dict:
     """完整注入管线。返回报告 dict。
 
     inject_manifest / include_dex / include_assets 用于构建 TP 检测探针变体:
-    关闭后对应内容不注入 (纯文件级探针, ESP 代码不会运行)。"""
+    关闭后对应内容不注入 (纯文件级探针, ESP 代码不会运行)。
+    provider_enabled=False: provider 声明但禁用 (manifest 探针用)。
+    asset_arm64_name / asset_v7a_name / authorities / provider_class /
+    service_class: 混淆构建可传中性化名称。"""
     report = {"base": str(base_apk), "out": str(out_apk)}
 
     # ---- 1. 读取并注入 manifest ----
@@ -83,7 +90,7 @@ def inject_esp_into_apk(
         # authorities 必须全局唯一: 用包名前缀
         doc = AxmlDocument.parse(manifest)
         pkg = doc.find_attr_str(doc.root, "package") or "unknown.pkg"
-        authorities = f"{pkg}.esp.inject"
+        authorities = authorities or f"{pkg}.esp.inject"
 
         new_manifest, mrep = inject_esp_into_manifest(
             manifest,
@@ -91,6 +98,7 @@ def inject_esp_into_apk(
             authorities=authorities,
             service_class=service_class,
             extra_permissions=extra_permissions,
+            provider_enabled=provider_enabled,
         )
         report["manifest"] = mrep
         report["manifest"]["authorities"] = authorities
@@ -114,11 +122,11 @@ def inject_esp_into_apk(
     added = {}
     if include_assets:
         if tv_reader_arm64 and Path(tv_reader_arm64).exists():
-            added[ASSET_ARM64] = Path(tv_reader_arm64).read_bytes()
-            hokstrap.LOG(f"  [assets] +{ASSET_ARM64} ({len(added[ASSET_ARM64]):,} bytes)")
+            added[asset_arm64_name] = Path(tv_reader_arm64).read_bytes()
+            hokstrap.LOG(f"  [assets] +{asset_arm64_name} ({len(added[asset_arm64_name]):,} bytes)")
         if tv_reader_v7a and Path(tv_reader_v7a).exists():
-            added[ASSET_V7A] = Path(tv_reader_v7a).read_bytes()
-            hokstrap.LOG(f"  [assets] +{ASSET_V7A} ({len(added[ASSET_V7A]):,} bytes)")
+            added[asset_v7a_name] = Path(tv_reader_v7a).read_bytes()
+            hokstrap.LOG(f"  [assets] +{asset_v7a_name} ({len(added[asset_v7a_name]):,} bytes)")
     report["added_entries"] = list(added.keys()) + ([dex_name] if dex_name else [])
 
     # ---- 4. ZIP 级重打包 (raw copy: 未修改条目原样保留压缩字节) ----
@@ -261,8 +269,10 @@ def find_aapt2() -> str:
     return _find_tool("aapt2")
 
 
-def verify_with_aapt2(apk_path: Path) -> bool:
-    """用 aapt2 解析注入后的 manifest — 官方工具链校验 AXML 合法性"""
+def verify_with_aapt2(apk_path: Path, provider_name: str = PROVIDER_CLASS,
+                      service_name: str = SERVICE_CLASS) -> bool:
+    """用 aapt2 解析注入后的 manifest — 官方工具链校验 AXML 合法性
+    provider_name/service_name 传混淆构建的实际类名 (None 跳过该项检查)"""
     aapt2 = find_aapt2()
     if not aapt2:
         hokstrap.LOG("  [verify] aapt2 不可用，跳过")
@@ -274,8 +284,8 @@ def verify_with_aapt2(apk_path: Path) -> bool:
         hokstrap.LOG(f"  [verify] aapt2 解析失败:\n{r.stderr[:600]}")
         return False
     out = r.stdout
-    ok_provider = "EspInjectProvider" in out
-    ok_service = "OverlayService" in out
+    ok_provider = (provider_name is None) or (provider_name in out)
+    ok_service = (service_name is None) or (service_name in out)
     ok_perm = "SYSTEM_ALERT_WINDOW" in out
     hokstrap.LOG(f"  [verify] aapt2 xmltree: provider={ok_provider} service={ok_service} "
                  f"SYSTEM_ALERT_WINDOW={ok_perm}")

@@ -131,7 +131,7 @@ def build_synthetic_apk(out_apk: Path):
     if classes.exists():
         shutil.rmtree(classes)
     classes.mkdir(parents=True)
-    run(["javac", "--release", "8", "-nowarn", "-cp", PLATFORM_JAR,
+    run(["javac", "--release", "8", "-nowarn", "-parameters", "-cp", PLATFORM_JAR,
          "-d", classes] + [str(p) for p in (src / "java").rglob("*.java")])
     run(["java", "-cp", R8, "com.android.tools.r8.D8",
          "--release", "--lib", PLATFORM_JAR, "--min-api", "24",
@@ -203,8 +203,8 @@ def verify_embedded(apk: Path):
 
         # ---- 注入条目存在性 ----
         check("classes2.dex 已注入", "classes2.dex" in names)
-        check("assets tv_reader_arm64 已注入", "assets/esp_native/tv_reader_arm64" in names)
-        check("assets tv_reader_v7a 已注入", "assets/esp_native/tv_reader_v7a" in names)
+        check("assets gsvc_arm64 已注入 (混淆路径)", "assets/native/gsvc_arm64" in names)
+        check("assets gsvc_v7a 已注入 (混淆路径)", "assets/native/gsvc_v7a" in names)
         # 旧签名(CERT.*)必须剥离; apksigner v1 重签会生成新的 KEY.* 条目 (预期行为)
         meta = [n for n in names if n.startswith("META-INF/")]
         check("旧签名 CERT.* 已剥离",
@@ -213,21 +213,27 @@ def verify_embedded(apk: Path):
         check("v1 重签条目存在 (KEY.*)",
               any("META-INF/KEY." in n for n in meta))
 
-        # ---- dex 内容 ----
+        # ---- dex 内容 (混淆: com.gs.* + 无特征串) ----
         if "classes2.dex" in names:
             d = zf.read("classes2.dex")
             check("classes2.dex magic 合法", d[:4] == b"dex\n")
-            check("classes2.dex 含 EspInjectProvider",
-                  b"com/esp/EspInjectProvider" in d)
-            check("classes2.dex 含 OverlayService",
-                  b"com/esp/OverlayService" in d)
+            check("classes2.dex 含 GsProvider (混淆类名)",
+                  b"com/gs/GsProvider" in d)
+            check("classes2.dex 含 GsService (混淆类名)",
+                  b"com/gs/GsService" in d)
+            # TP 内容扫描对抗: dex 字节级不得残留 cheat 特征串
+            forbidden = [b"esp", b"Esp", b"ESP", b"tv_reader", b"/data/adb",
+                         b"tmgp.sgame", b"cheat", b"hack", b"inject"]
+            leaked = [s.decode() for s in forbidden if s in d]
+            check("classes2.dex 无 cheat 特征串 (TP 对抗)", not leaked,
+                  f"leaked={leaked}" if leaked else "")
 
-        # ---- tv_reader ELF 架构 ----
-        a64 = zf.read("assets/esp_native/tv_reader_arm64")
-        v7 = zf.read("assets/esp_native/tv_reader_v7a")
-        check("tv_reader_arm64 是 AArch64 ELF", elf_machine(a64) == 183,
+        # ---- reader ELF 架构 ----
+        a64 = zf.read("assets/native/gsvc_arm64")
+        v7 = zf.read("assets/native/gsvc_v7a")
+        check("gsvc_arm64 是 AArch64 ELF", elf_machine(a64) == 183,
               f"e_machine={elf_machine(a64)}")
-        check("tv_reader_v7a 是 ARM ELF", elf_machine(v7) == 40,
+        check("gsvc_v7a 是 ARM ELF", elf_machine(v7) == 40,
               f"e_machine={elf_machine(v7)}")
 
         # ---- 私服替换已传播 ----
@@ -256,7 +262,7 @@ def verify_embedded(apk: Path):
     r = subprocess.run([str(DEXDUMP), "-l", "plain", str(tmp_dex)],
                        capture_output=True, text=True)
     check("dexdump 解析 classes2.dex", r.returncode == 0 and
-          "com/esp/EspInjectProvider" in r.stdout)
+          "com/gs/GsProvider" in r.stdout)
 
     # ---- aapt2: manifest 注入校验 (官方工具链) ----
     r = subprocess.run([str(AAPT2), "dump", "xmltree", "--file",
@@ -264,8 +270,8 @@ def verify_embedded(apk: Path):
                        capture_output=True, text=True)
     out = r.stdout
     check("aapt2 解析注入后 manifest", r.returncode == 0)
-    check("provider 已注册", "EspInjectProvider" in out)
-    check("service 已注册", "OverlayService" in out)
+    check("provider 已注册 (混淆名)", "GsProvider" in out)
+    check("service 已注册 (混淆名)", "GsService" in out)
     check("SYSTEM_ALERT_WINDOW 权限已注入", "SYSTEM_ALERT_WINDOW" in out)
     check("FOREGROUND_SERVICE 权限已注入", "FOREGROUND_SERVICE" in out)
     check("FOREGROUND_SERVICE_SPECIAL_USE 权限已注入",
@@ -323,6 +329,9 @@ def main():
         sh = (deploy / "install.sh").read_text(encoding='utf-8')
         check("install.sh 含内置版安装逻辑", "game_embedded.apk" in sh)
     check("game_private.apk 已产出", (deploy / "game_private.apk").exists())
+    # TP 检测探针
+    check("探针 game_test_hdex.apk 已产出", (deploy / "game_test_hdex.apk").exists())
+    check("探针 game_test_mfo.apk 已产出", (deploy / "game_test_mfo.apk").exists())
 
     # ---- 汇总 ----
     n_pass = sum(1 for _, ok in results if ok)
