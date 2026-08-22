@@ -34,7 +34,12 @@
 
 #define GAME_PKG_DEFAULT "com.tencent.tmgp.sgame"
 #define PORT_DEFAULT 47291
-#define MAX_READS_PER_SEC 1200
+/*
+ * 读取限流: pread 单次 ~1-2μs, 60000/s 的 CPU 开销约 10%。
+ * 注意: 全堆扫描一轮需要 ~26 万次读取, 限流过低 (旧值 1200/s)
+ * 会导致扫描一轮要 218 秒且每帧从头重扫 → 永远扫不到 actor。
+ */
+#define MAX_READS_PER_SEC 60000
 #define READ_BATCH_SIZE 256
 #define FRAME_INTERVAL_US 33000
 #define MAX_ACTORS 64
@@ -249,6 +254,19 @@ typedef struct {
     int read_count;
 } MemReader;
 
+/*
+ * ---- Actor 列表缓存 (跨帧) ----
+ * 旧实现每帧从堆头全量重扫 (26 万次读取), 且被限流打断后进度作废,
+ * 导致 actor 永远扫不到。现在:
+ *   g_actor_list_cache: 已命中的 actor 指针数组地址, 命中帧只读 ~百次;
+ *   g_scan_cursor / g_scan_range_idx: 全扫描跨帧续扫游标。
+ */
+static uintptr_t g_actor_list_cache = 0;
+static uintptr_t g_scan_cursor = 0;
+static int g_scan_range_idx = 0;
+static int g_scan_budget_override = 0;  /* >0: 诊断模式用大预算一次性扫完 */
+static int g_no_throttle = 0;           /* 诊断模式旁路限流 */
+
 static int mem_reader_open(MemReader *mr, pid_t pid) {
     mr->pid = pid;
     mr->fd = -1;
@@ -260,18 +278,15 @@ static int mem_reader_open(MemReader *mr, pid_t pid) {
 
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-    
-    /* 
+
+    /*
      * Open /proc/pid/mem with O_RDONLY.
      * This avoids ptrace entirely - no PTRACE_TRACEME syscall.
      * Anti-cheat can't detect /proc/pid/mem opens easily on modern Linux.
      */
-    mr->fd = open(path, O_RDONLY | O_NOCTTY | O_DIRECTORY);
+    mr->fd = open(path, O_RDONLY | O_NOCTTY);
     if (mr->fd < 0) {
-        mr->fd = open(path, O_RDONLY);
-    }
-    if (mr->fd < 0) {
-        /* 
+        /*
          * Fallback: use process_vm_readv (needs same uid or root)
          * This is even less detectable than /proc/pid/mem
          */
@@ -280,8 +295,14 @@ static int mem_reader_open(MemReader *mr, pid_t pid) {
 
     mr->range_count = parse_maps(pid, mr->ranges, MAX_RANGES);
     if (mr->range_count <= 0) return -1;
-    
+
     mr->heap = find_largest_heap_range(mr->ranges, mr->range_count);
+
+    /* 新进程/重连: 内存布局已变, 清空 actor 扫描缓存与游标 */
+    g_actor_list_cache = 0;
+    g_scan_cursor = 0;
+    g_scan_range_idx = 0;
+
     return mr->heap ? 0 : -1;
 }
 
@@ -299,7 +320,7 @@ static int read_mem(MemReader *mr, uintptr_t addr, void *buf, size_t len) {
         mr->reads_per_second = 0;
         mr->last_sec_ts = now;
     }
-    if (mr->reads_per_second >= MAX_READS_PER_SEC) {
+    if (!g_no_throttle && mr->reads_per_second >= MAX_READS_PER_SEC) {
         return -2; /* throttled */
     }
     mr->reads_per_second++;
@@ -418,175 +439,207 @@ static int read_string(MemReader *mr, uintptr_t addr, char *buf, size_t maxlen) 
  *   0x40 = ally (blue side)
  *   0x1C = enemy (red side)
  */
+
+/*
+ * 从一个 actor 指针提取全部字段。
+ * 返回 1 = 合法 actor (type/team 校验通过), 0 = 不是 actor。
+ */
+static int extract_actor_slot(MemReader *mr, uintptr_t aptr, ActorData *a) {
+    memset(a, 0, sizeof(*a));
+
+    /* Validate this is an actor by reading its type field */
+    int32_t type_id;
+    if (read_i32(mr, aptr + ACTOR_TYPE_OFFSET, &type_id) != 0) return 0;
+    if (type_id <= 0 || type_id > 500) return 0;  /* not a valid entity type */
+
+    int32_t team_id;
+    if (read_i32(mr, aptr + ACTOR_TEAM_OFFSET, &team_id) != 0) return 0;
+    if (team_id != TEAM_ALLY && team_id != TEAM_ENEMY) return 0;
+
+    a->type = type_id;
+    a->team_id = team_id;
+
+    /* Extract position via the pos anchor chain */
+    uintptr_t pos_anchor;
+    if (read_ptr(mr, aptr + POS_ANCHOR_OFFSET, &pos_anchor) == 0) {
+        /*
+         * Sanity check: pos_anchor should point to a valid float area
+         * We validate by checking that all floats are in reasonable ranges
+         */
+        float fx, fy, fz;
+        if (read_f32(mr, pos_anchor + POS_X_OFFSET, &fx) == 0 &&
+            read_f32(mr, pos_anchor + POS_Y_OFFSET, &fy) == 0 &&
+            read_f32(mr, pos_anchor + POS_Z_OFFSET, &fz) == 0) {
+
+            /* Validate position in map bounds with some tolerance */
+            if (fx >= MAP_X_MIN * 1.5f && fx <= MAP_X_MAX * 1.5f &&
+                fz >= MAP_Z_MIN * 1.5f && fz <= MAP_Z_MAX * 1.5f &&
+                fy > -500.0f && fy < 500.0f) {
+                a->x = fx;
+                a->y = fy;
+                a->z = fz;
+                a->visible = 1;
+            }
+        }
+    }
+
+    /* Read health */
+    if (read_i32(mr, aptr + 0x190, &a->hp) != 0) {
+        a->hp = 0;
+    }
+    if (read_i32(mr, aptr + 0x194, &a->max_hp) != 0) {
+        a->max_hp = a->hp;
+    }
+
+    /* Read name and name_id */
+    read_string(mr, aptr + ACTOR_NAME_OFFSET, a->name, sizeof(a->name));
+    read_i32(mr, aptr + ACTOR_NAMEID_OFFSET, &a->name_id);
+    if (a->name_id < 0) a->name_id = 0;
+
+    /* Read level */
+    int32_t lvl;
+    if (read_i32(mr, aptr + ACTOR_LEVEL_OFFSET, &lvl) == 0) {
+        a->level = clamp_i(lvl, 0, 15);
+    }
+
+    /* Read facing angle and speed */
+    read_f32(mr, aptr + ACTOR_FACING_OFFSET, &a->facing_angle);
+    read_f32(mr, aptr + ACTOR_SPEED_OFFSET, &a->speed);
+
+    /* Read ultimate cooldown */
+    if (read_f32(mr, aptr + ACTOR_ULTCD_OFFSET, &a->ultimate_cd) != 0) {
+        a->ultimate_cd = 0.0f;
+    }
+    if (read_f32(mr, aptr + ACTOR_ULTTOT_OFFSET, &a->ultimate_total) != 0) {
+        a->ultimate_total = 0.0f;
+    }
+
+    /* Read summoner skills */
+    a->skill_count = 0;
+    if (a->type >= 1 && a->type <= 50) {
+        uintptr_t skills_base;
+        if (read_ptr(mr, aptr + ACTOR_SKILLS_OFFSET, &skills_base) == 0) {
+            for (int si = 0; si < MAX_SKILLS_PER_ACTOR; si++) {
+                SummonerSkill *sk = &a->skills[si];
+                uintptr_t slot_ptr = skills_base + si * SKILL_SLOT_SIZE;
+                if (read_i32(mr, slot_ptr + SKILL_SPELLID_OFFSET, &sk->spell_id) != 0) break;
+                if (sk->spell_id <= 0 || sk->spell_id > 500) continue;
+
+                read_f32(mr, slot_ptr + SKILL_CDREM_OFFSET, &sk->cd_remaining);
+                read_f32(mr, slot_ptr + SKILL_CDTOT_OFFSET, &sk->cd_total);
+                int32_t ready;
+                read_i32(mr, slot_ptr + SKILL_READY_OFFSET, &ready);
+                sk->ready = (ready != 0 || sk->cd_remaining <= 0.0f) ? 1 : 0;
+
+                if (sk->cd_remaining < 0.0f) sk->cd_remaining = 0.0f;
+                if (sk->cd_total < 0.0f) sk->cd_total = 0.0f;
+                a->skill_count++;
+            }
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * 从 list_base 开始逐槽提取 actor, 写入 actors 数组。
+ * 返回本次成功提取的个数。
+ */
+static int harvest_actor_list(MemReader *mr, uintptr_t list_base,
+                              ActorData *actors, int max_actors) {
+    int n = 0;
+    for (int k = 0; k < MAX_ACTORS && n < max_actors; k++) {
+        uintptr_t aptr;
+        if (read_ptr(mr, list_base + (uintptr_t)k * 8, &aptr) != 0) break;
+        if (aptr == 0) continue;  /* 空槽跳过, 继续看下一槽 */
+
+        /* 指针必须落在某个已知 rw 匿名段内 */
+        if (!find_range_for_addr(mr->ranges, mr->range_count, aptr)) continue;
+
+        if (extract_actor_slot(mr, aptr, &actors[n])) {
+            n++;
+        }
+    }
+    return n;
+}
+
 static int parse_actors(MemReader *mr, ActorData *actors, int max_actors, int *out_count) {
-    /* Step 1: Find the game anchor structure in heap */
-    uintptr_t heap_start = mr->heap->start;
-    uintptr_t heap_end = mr->heap->end;
-    size_t heap_size = heap_end - heap_start;
-    
-    /* 
-     * Scan the heap for a pattern that looks like the actor list base.
-     * The list base is a pointer array containing actor pointers.
-     * We look for a sequence of valid pointers pointing to actor structures.
-     * 
-     * Optimization: instead of scanning the whole heap, we sample at
-     * likely locations and validate.
-     */
-    
     *out_count = 0;
-    
-    /* Scan for pointer arrays in heap at likely offsets */
-    uintptr_t scan_start = heap_start;
-    uintptr_t scan_end = heap_end;
-    
-    /* 
-     * The actor list typically resides at offsets 0x10000-0x40000 into the heap
-     * for typical game versions. We use a sliding window approach.
+
+    /* ---- 快速路径: 上一帧命中的列表地址仍有效 ---- */
+    if (g_actor_list_cache != 0) {
+        int n = harvest_actor_list(mr, g_actor_list_cache, actors, max_actors);
+        if (n >= 3) {           /* 至少 3 个有效 actor 视为缓存仍有效 */
+            *out_count = n;
+            return 0;
+        }
+        /* 列表失效 (对局结束/结构移动), 清缓存走全扫描 */
+        g_actor_list_cache = 0;
+    }
+
+    /*
+     * ---- 全扫描: 遍历所有 rw 匿名段 (不只最大段), 跨帧续扫 ----
+     * 每段窗口取 min(段大小, SCAN_WINDOW_PER_RANGE)。
+     * 被限流/帧间隔打断时游标保留, 下一帧接着扫。
      */
     const size_t scan_stride = 8;
-    const size_t max_scan = 2000000; /* 2MB scan window */
-    
-    if (heap_size > max_scan) {
-        scan_end = scan_start + max_scan;
-    }
-    
-    int found = 0;
-    uint64_t scan_idx = 0;
-    
-    for (uintptr_t addr = scan_start; addr < scan_end && *out_count < max_actors; 
-         addr += scan_stride, scan_idx++) {
-        
-        /* 
-         * Heuristic: actor pointers point within the heap range.
-         * A valid actor array slot is a non-null pointer inside heap.
-         * We look for arrays of 2-50 valid pointers (actor lists are small).
-         */
-        uintptr_t ptr0;
-        if (read_ptr(mr, addr, &ptr0) != 0) continue;
-        
-        if (ptr0 < heap_start || ptr0 >= heap_end) continue;
-        
-        /* Check adjacent slots for more valid actor pointers */
-        int actor_start = *out_count;
-        int slots_checked = 0;
-        
-        for (int k = 0; k < MAX_ACTORS && *out_count < max_actors; k++) {
-            uintptr_t aptr;
-            if (read_ptr(mr, addr + k * 8, &aptr) != 0) break;
-            if (aptr < heap_start || aptr >= heap_end) break;
-            
-            /* Validate this is an actor by reading its type field */
-            int32_t type_id;
-            if (read_i32(mr, aptr + ACTOR_TYPE_OFFSET, &type_id) != 0) break;
-            
-            if (type_id <= 0 || type_id > 500) break;  /* not a valid entity type */
-            
-            /* 
-             * Additional validation: read team_id, must be known team
-             * Skip non-player entities that we don't care about
-             */
-            int32_t team_id;
-            if (read_i32(mr, aptr + ACTOR_TEAM_OFFSET, &team_id) != 0) continue;
-            
-            if (team_id != TEAM_ALLY && team_id != TEAM_ENEMY) continue;
-            
-            /* Valid actor found - extract full data */
-            ActorData *a = &actors[*out_count];
-            memset(a, 0, sizeof(*a));
-            
-            a->type = type_id;
-            a->team_id = team_id;
-            
-            /* Extract position via the pos anchor chain */
-            uintptr_t pos_anchor;
-            if (read_ptr(mr, aptr + POS_ANCHOR_OFFSET, &pos_anchor) == 0) {
-                /* 
-                 * Sanity check: pos_anchor should point to a valid float area
-                 * We validate by checking that all floats are in reasonable ranges
-                 */
-                float fx, fy, fz;
-                if (read_f32(mr, pos_anchor + POS_X_OFFSET, &fx) == 0 &&
-                    read_f32(mr, pos_anchor + POS_Y_OFFSET, &fy) == 0 &&
-                    read_f32(mr, pos_anchor + POS_Z_OFFSET, &fz) == 0) {
-                    
-                    /* Validate position in map bounds with some tolerance */
-                    if (fx >= MAP_X_MIN * 1.5f && fx <= MAP_X_MAX * 1.5f &&
-                        fz >= MAP_Z_MIN * 1.5f && fz <= MAP_Z_MAX * 1.5f &&
-                        fy > -500.0f && fy < 500.0f) {
-                        a->x = fx;
-                        a->y = fy;
-                        a->z = fz;
-                        a->visible = 1;
-                    }
-                }
-            }
-            
-            /* Read health */
-            if (read_i32(mr, aptr + 0x190, &a->hp) != 0) {
-                a->hp = 0;
-            }
-            if (read_i32(mr, aptr + 0x194, &a->max_hp) != 0) {
-                a->max_hp = a->hp;
-            }
-            
-            /* Read name and name_id */
-            read_string(mr, aptr + ACTOR_NAME_OFFSET, a->name, sizeof(a->name));
-            read_i32(mr, aptr + ACTOR_NAMEID_OFFSET, &a->name_id);
-            if (a->name_id < 0) a->name_id = 0;
-            
-            /* Read level */
-            int32_t lvl;
-            if (read_i32(mr, aptr + ACTOR_LEVEL_OFFSET, &lvl) == 0) {
-                a->level = clamp_i(lvl, 0, 15);
-            }
-            
-            /* Read facing angle and speed */
-            read_f32(mr, aptr + ACTOR_FACING_OFFSET, &a->facing_angle);
-            read_f32(mr, aptr + ACTOR_SPEED_OFFSET, &a->speed);
-            
-            /* Read ultimate cooldown */
-            if (read_f32(mr, aptr + ACTOR_ULTCD_OFFSET, &a->ultimate_cd) != 0) {
-                a->ultimate_cd = 0.0f;
-            }
-            if (read_f32(mr, aptr + ACTOR_ULTTOT_OFFSET, &a->ultimate_total) != 0) {
-                a->ultimate_total = 0.0f;
-            }
-            
-            /* Read summoner skills */
-            a->skill_count = 0;
-            if (a->type >= 1 && a->type <= 50) {
-                uintptr_t skills_base;
-                if (read_ptr(mr, aptr + ACTOR_SKILLS_OFFSET, &skills_base) == 0) {
-                    for (int si = 0; si < MAX_SKILLS_PER_ACTOR; si++) {
-                        SummonerSkill *sk = &a->skills[si];
-                        uintptr_t slot_ptr = skills_base + si * SKILL_SLOT_SIZE;
-                        if (read_i32(mr, slot_ptr + SKILL_SPELLID_OFFSET, &sk->spell_id) != 0) break;
-                        if (sk->spell_id <= 0 || sk->spell_id > 500) continue;
-                        
-                        read_f32(mr, slot_ptr + SKILL_CDREM_OFFSET, &sk->cd_remaining);
-                        read_f32(mr, slot_ptr + SKILL_CDTOT_OFFSET, &sk->cd_total);
-                        int32_t ready;
-                        read_i32(mr, slot_ptr + SKILL_READY_OFFSET, &ready);
-                        sk->ready = (ready != 0 || sk->cd_remaining <= 0.0f) ? 1 : 0;
-                        
-                        if (sk->cd_remaining < 0.0f) sk->cd_remaining = 0.0f;
-                        if (sk->cd_total < 0.0f) sk->cd_total = 0.0f;
-                        a->skill_count++;
-                    }
-                }
-            }
-            
-            (*out_count)++;
-            slots_checked++;
+    const size_t SCAN_WINDOW_PER_RANGE = 8 * 1024 * 1024;  /* 每段最多扫 8MB */
+    const int SCAN_BUDGET_PER_CALL = 20000;                /* 单次调用最多探测 2 万个地址 */
+    const int budget = g_scan_budget_override > 0 ? g_scan_budget_override : SCAN_BUDGET_PER_CALL;
+
+    int probed = 0;
+    while (probed < budget) {
+        /* 换到下一个有效段 */
+        if (g_scan_range_idx >= mr->range_count) {
+            /* 所有段扫完一轮没找到 → 重置从头再来 */
+            g_scan_range_idx = 0;
+            g_scan_cursor = 0;
+            return -1;
         }
-        
-        if (slots_checked >= 5) {
-            found = 1;
-            break;  /* Found actor list, stop scanning */
+        MmapRange *r = &mr->ranges[g_scan_range_idx];
+        uintptr_t seg_start = r->start;
+        uintptr_t seg_end = r->end;
+        if (seg_end - seg_start > SCAN_WINDOW_PER_RANGE) {
+            seg_end = seg_start + SCAN_WINDOW_PER_RANGE;
+        }
+
+        /* 初始化/推进游标 */
+        if (g_scan_cursor < seg_start || g_scan_cursor >= seg_end) {
+            g_scan_cursor = seg_start;
+        }
+
+        for (uintptr_t addr = g_scan_cursor; addr + 8 <= seg_end && probed < budget;
+             addr += scan_stride, probed++) {
+
+            /* 游标始终指向下一个待探测地址 (break 后下帧从这续扫) */
+            g_scan_cursor = addr + scan_stride;
+
+            uintptr_t ptr0;
+            if (read_ptr(mr, addr, &ptr0) != 0) continue;   /* 含节流 (-2): 也算消耗预算 */
+
+            if (ptr0 == 0) continue;
+            if (ptr0 < r->start || ptr0 >= r->end) continue; /* 必须指向本段内 */
+
+            /* 候选列表: 从 addr 起连续提取 */
+            int n = harvest_actor_list(mr, addr, actors, max_actors);
+            if (n >= 5) {
+                /* 命中! 缓存列表地址, 本帧数据已就绪 */
+                g_actor_list_cache = addr;
+                *out_count = n;
+                return 0;
+            }
+        }
+
+        /* 本段扫完 → 下一个段; 预算耗尽 → 游标留在当前位置, 下帧续扫 */
+        if (g_scan_cursor >= seg_end) {
+            g_scan_range_idx++;
+            g_scan_cursor = 0;
+        } else {
+            break;
         }
     }
-    
-    return found ? 0 : -1;
+
+    return -1;  /* 本次调用没扫到 (可能续扫中) */
 }
 
 /* ---- TVEF protocol v3 ---- */
@@ -853,6 +906,10 @@ int main(int argc, char **argv) {
         ActorData actors[MAX_ACTORS];
         GlobalTimer timers[MAX_GLOBAL_TIMERS];
         int count;
+        /* 诊断模式: 大预算 + 旁路限流, 一次性扫完所有 rw 匿名段 */
+        g_scan_budget_override = 5000000;
+        g_no_throttle = 1;
+        fprintf(stderr, "[tv_reader] Scan-only mode: scanning all rw ranges...\n");
         if (parse_actors(&mr, actors, MAX_ACTORS, &count) == 0) {
             fprintf(stderr, "[tv_reader] Found %d actors:\n", count);
             for (int i = 0; i < count; i++) {
@@ -871,7 +928,10 @@ int main(int argc, char **argv) {
                 }
             }
         } else {
-            fprintf(stderr, "[tv_reader] No actors found (scanning...)\n");
+            fprintf(stderr, "[tv_reader] No actors found.\n");
+            fprintf(stderr, "[tv_reader] ranges=%d reads=%llu\n",
+                    mr.range_count, (unsigned long long)mr.read_count);
+            fprintf(stderr, "[tv_reader] 可能原因: ① 游戏不在对局中 ② 偏移与当前版本不匹配 ③ team/type 校验过严\n");
         }
         
         int tcount = scan_global_timers(&mr, timers);
