@@ -124,12 +124,16 @@ jobs:
         run: |
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
           SERVER="${{ github.event.inputs.server }}"
+          # 分体模式: 游戏包不加 dex/不改 manifest (TP 双重校验, 内置必死),
+          # ESP 用独立应用 + root 外部读内存; e2e 阶段仍全量验证注入管线
           if [ -n "$SERVER" ]; then
             echo "[*] 模式: 私服 → $SERVER"
-            python3 ultimate_builder.py official.apk --server "$SERVER" -o output --force
+            python3 ultimate_builder.py official.apk --server "$SERVER" -o output --force \
+              --skip-embed --with-overlay
           else
             echo "[*] 模式: 直连官服 (不替换服务器地址)"
-            python3 ultimate_builder.py official.apk -o output --force
+            python3 ultimate_builder.py official.apk -o output --force \
+              --skip-embed --with-overlay
           fi
 
       - name: Upload deploy bundle
@@ -138,10 +142,8 @@ jobs:
         with:
           name: hok-embedded-${{ github.run_number }}
           path: |
-            output/deploy/game_embedded.apk
             output/deploy/game_official.apk
-            output/deploy/game_test_hdex.apk
-            output/deploy/game_test_mfo.apk
+            output/deploy/esp_overlay.apk
             output/deploy/install.sh
             output/deploy/README.txt
           if-no-files-found: warn

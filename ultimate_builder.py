@@ -806,16 +806,20 @@ adb shell "appops set com.esp SYSTEM_ALERT_WINDOW allow" 2>/dev/null || true
 echo "[*] 启动游戏..."
 adb shell "am start -n {game_pkg}/{game_pkg}.SGameActivity"
 
+if [ -f "$ESP_APK" ]; then
+    echo "[*] 启动 ESP Overlay 应用..."
+    sleep 3
+    adb shell "am start -n com.esp/.MainActivity"
+fi
+
 echo ""
 echo "=============================================="
 echo "  部署完成！"
-echo "  模式: {'直连官方' if is_official else '私服模式'}"
+echo "  模式: {'直连官方' if is_official else '私服模式'} (分体: 游戏 + 独立 ESP)"
 echo "=============================================="
 echo ""
-echo "  1. 打开 ESP Overlay 应用"
-echo "  2. 授予 'Draw over other apps' 权限"
-echo "  3. 点击 'Start ESP Overlay'"
-echo "  4. 在游戏中即可看到 ESP 小地图"
+echo "  1. ESP 应用内点击启动 (首次会请求 Root 部署 tv_reader)"
+echo "  2. 进入对局后 ESP 悬浮窗显示敌人位置"
 echo ""
 echo "  调试命令:"
 echo "    adb shell 'su -c \"ps -A | grep tv_reader\"'"
@@ -844,20 +848,26 @@ echo ""
 ESP 端口: {port}
 
 文件说明:
-  {out_game_name}      — {"官方版 APK (已重打包+签名)" if is_official else "已注入私服 IP 的直装 APK"}
+  {out_game_name}      — {"官方版 APK (已重打包+签名, 不含任何注入)" if is_official else "已注入私服 IP 的直装 APK"}
   esp_overlay.apk       — ESP 悬浮窗服务 (自包含 tv_reader, 独立应用)
   install.sh            — 一键部署脚本
 {embedded_doc}
-分体模式 (game + esp_overlay.apk):
-  chmod +x install.sh
-  ./install.sh
+分体模式 (推荐, TP 实测唯一可行方案):
+  游戏包不加 dex/不改 manifest (TP 双重校验), ESP 独立应用 + root
+  外部读取游戏内存, 悬浮窗绘制 — 游戏进程零改动:
+    chmod +x install.sh
+    ./install.sh
+  或手动:
+    adb install -r {out_game_name}
+    adb install -r esp_overlay.apk
+    adb shell "appops set com.esp SYSTEM_ALERT_WINDOW allow"
+    打开 ESP 应用 → 启动 (首次授权 Root) → 进对局看悬浮窗
 
-ESP 使用 (内置版):
-  1. adb install -r game_embedded.apk
-  2. 授予悬浮窗权限:
-     adb shell "appops set {game_pkg} SYSTEM_ALERT_WINDOW allow"
-  3. 启动游戏 — 数秒后 ESP 悬浮窗自动出现
-  4. 首次运行会请求 Root (部署 tv_reader 到 /data/adb/esp/)
+ESP 使用 (分体模式):
+  1. 先启动游戏进入对局
+  2. 打开 ESP Overlay 应用, 点击启动
+  3. 首次运行会请求 Root (部署 tv_reader) — Magisk/KernelSU 授权
+  4. 悬浮窗出现后即显示敌人位置/小地图
 
 注意:
   - 需要 Root 权限 (Magisk / KernelSU)
@@ -866,13 +876,11 @@ ESP 使用 (内置版):
   - 若 ESP 无显示，检查 reader 日志:
     adb shell "su -c 'tail -50 /data/local/tmp/.gs/gsvc.log'"
 
-TP 反作弊检测探针 (定位检测项, 逐个安装测试):
-  game_test_hdex.apk — 仅追加无害 classesN.dex (不动 manifest/assets)
-    能进游戏 → TP 扫描 dex 内容而非文件数 → game_embedded 混淆有效
-    被杀     → TP 检测 dex 文件存在 → 单包内置不可行, 用分体模式
-  game_test_mfo.apk  — 仅改 manifest (权限+service+禁用provider, 无 dex)
-    能进游戏 → manifest 结构不被检测
-    被杀     → TP 校验 manifest → 单包内置不可行, 用分体模式
+TP 反作弊检测结论 (探针实测):
+  +assets 文件      → 不检测, 可自由添加
+  +classesN.dex     → 检测文件数量 (无害 dex 也被杀) → 单包内置不可行
+  manifest 任何修改 → 检测 (权限/组件新增即被杀)   → 单包内置不可行
+  结论: 游戏包只能"重打包+重签名", 功能外置 = 分体模式唯一可行
 ''', encoding='utf-8')
 
     ok(f"部署包 → {deploy_dir}/")
