@@ -709,8 +709,8 @@ def build_esp_overlay_apk(sdk: Path, tv_bins: dict, out_dir: Path,
     
     if r.returncode != 0:
         fail(f"APK build failed")
-        if r.stderr: print(r.stderr[-600:])
-        if r.stdout: print(r.stdout[-300:])
+        if r.stderr: print(r.stderr[-3000:])
+        if r.stdout: print(r.stdout[-1000:])
         return None
     
     # Find output APK (限定 outputs 目录, 避免 rglob 误中缓存 APK)
