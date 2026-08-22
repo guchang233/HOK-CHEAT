@@ -63,7 +63,7 @@ class EspCanvasView(
 
     private val density = resources.displayMetrics.density
 
-    // ---- 画笔 ----
+    // ---- 画笔 (尺寸在 init 中按 density 缩放) ----
     private val paintBg = Paint(Paint.ANTI_ALIAS_FLAG)
     private val paintBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; strokeWidth = 1.5f
@@ -94,47 +94,65 @@ class EspCanvasView(
         style = Paint.Style.STROKE; strokeWidth = 1f
     }
     private val paintText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = C_TEXT; textSize = 15f; typeface = Typeface.DEFAULT_BOLD
+        color = C_TEXT; typeface = Typeface.DEFAULT_BOLD
     }
-    private val paintTextDim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = C_DIM; textSize = 12f
-    }
+    private val paintTextDim = Paint(Paint.ANTI_ALIAS_FLAG)
     private val paintTextSmall = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = C_TEXT; textSize = 11f; typeface = Typeface.DEFAULT_BOLD
+        color = C_TEXT; typeface = Typeface.DEFAULT_BOLD
+    }
+
+    init {
+        val ds = density
+        paintBorder.strokeWidth *= ds
+        paintGrid.strokeWidth *= ds
+        paintTick.strokeWidth *= ds
+        paintArc.strokeWidth *= ds
+        paintBracket.strokeWidth *= ds
+        paintLine.strokeWidth *= ds
+        paintSweep.strokeWidth *= ds
+        paintChipStroke.strokeWidth *= ds
+        paintText.textSize = 15f * ds
+        paintTextDim.textSize = 12f * ds
+        paintTextDim.color = C_DIM
+        paintTextSmall.textSize = 11f * ds
     }
 
     private val rectTmp = RectF()
     private val chipRect = RectF()
 
     // ---- 对外接口 ----
+    // 注意: updateFrame 由读取线程调用, requestLayout 必须切回 UI 线程
     fun updateFrame(frame: EspFrame?) {
         val had = hadTimers
         currentFrame = frame
         val has = frame?.timers?.isNotEmpty() == true
         if (had != has) {
             hadTimers = has
-            requestLayout()
+            post { requestLayout() }
         }
         postInvalidate()
     }
 
     fun setMapSize(size: Int) {
-        mapSize = size.coerceIn(200, 640)
+        mapSize = size.coerceIn((200 * density).toInt(), (640 * density).toInt())
         requestLayout()
         postInvalidate()
     }
 
-    fun setRadar(v: Boolean) { showRadar = v; requestLayout(); postInvalidate() }
+    fun setRadar(v: Boolean) { showRadar = v; post { requestLayout() }; postInvalidate() }
     fun setLines(v: Boolean) { showLines = v; postInvalidate() }
     fun setHp(v: Boolean) { showHp = v; postInvalidate() }
     fun setSkills(v: Boolean) { showSkills = v; postInvalidate() }
     fun setUlt(v: Boolean) { showUlt = v; postInvalidate() }
-    fun setTimers(v: Boolean) { showTimers = v; requestLayout(); postInvalidate() }
+    fun setTimers(v: Boolean) { showTimers = v; post { requestLayout() }; postInvalidate() }
     fun setLevels(v: Boolean) { showLevels = v; postInvalidate() }
     fun setDist(v: Boolean) { showDist = v; postInvalidate() }
     fun setFacing(v: Boolean) { showFacing = v; postInvalidate() }
 
-    private fun timerPanelHeight(rows: Int): Int = 42 + rows * 36 + 10
+    // 像素按密度缩放 (雷达整体以 px 为单位, 文字/间距需跟随 density)
+    private fun d(v: Float): Float = v * density
+
+    private fun timerPanelHeight(rows: Int): Int = (d(42f) + rows * d(36f) + d(10f)).toInt()
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val frame = currentFrame
@@ -170,14 +188,14 @@ class EspCanvasView(
     // ==================== 雷达 ====================
     private fun drawRadar(canvas: Canvas, frame: EspFrame) {
         val size = mapSize.toFloat()
-        val pad = 8f
+        val pad = d(8f)
         val inner = size - pad * 2f
 
         // 玻璃底
         paintBg.color = C_GLASS
         rectTmp.set(0f, 0f, size, size)
-        canvas.drawRoundRect(rectTmp, 12f, 12f, paintBg)
-        canvas.drawRoundRect(rectTmp, 12f, 12f, paintBorder)
+        canvas.drawRoundRect(rectTmp, d(12f), d(12f), paintBg)
+        canvas.drawRoundRect(rectTmp, d(12f), d(12f), paintBorder)
 
         // 网格 (4x4 内线)
         for (i in 1..3) {
@@ -189,24 +207,26 @@ class EspCanvasView(
         // 角标
         drawCornerTicks(canvas, size)
 
-        // 头部统计芯片
+        // 头部统计芯片 (横排: 敌/我/怪 + 右侧对局时间)
         val enemies = frame.actors.count { !it.ally && it.isHero }
         val allies = frame.actors.count { it.ally && it.isHero }
         val monsters = frame.actors.count { it.isMonster }
         paintTextSmall.color = C_TEXT
-        drawChip(canvas, "敌 $enemies", pad + 28f, pad + 16f,
-            paintTextSmall, Color.argb(150, 120, 20, 28), C_ENEMY)
-        drawChip(canvas, "我 $allies", pad + 82f, pad + 16f,
-            paintTextSmall, Color.argb(140, 16, 70, 40), C_ALLY)
-        drawChip(canvas, "怪 $monsters", pad + 136f, pad + 16f,
-            paintTextSmall, Color.argb(140, 40, 40, 52), C_DIM)
+        val chipCy = pad + d(16f)
+        var chipCx = pad
+        chipCx = drawChip(canvas, "敌 $enemies", chipCx, chipCy,
+            paintTextSmall, Color.argb(150, 120, 20, 28), C_ENEMY, startAlign = true) + d(4f)
+        chipCx = drawChip(canvas, "我 $allies", chipCx, chipCy,
+            paintTextSmall, Color.argb(140, 16, 70, 40), C_ALLY, startAlign = true) + d(4f)
+        drawChip(canvas, "怪 $monsters", chipCx, chipCy,
+            paintTextSmall, Color.argb(140, 40, 40, 52), C_DIM, startAlign = true)
         if (frame.gameTime > 0f) {
             val gm = frame.gameTime.toInt()
             val mm = (gm / 60).toString().padStart(2, '0')
             val ss = (gm % 60).toString().padStart(2, '0')
             val t = "$mm:$ss"
-            val w = paintTextSmall.measureText(t) + 20f
-            drawChip(canvas, t, size - pad - w / 2f, pad + 16f,
+            val w = chipWidth(t, paintTextSmall)
+            drawChip(canvas, t, size - pad - w / 2f, chipCy,
                 paintTextSmall, Color.argb(150, 6, 40, 52), C_ACCENT)
         }
 
@@ -217,7 +237,7 @@ class EspCanvasView(
         val cy = mapY(frame.selfZ)
 
         // 扫描线
-        drawSweep(canvas, cx, cy, inner / 2f - 6f)
+        drawSweep(canvas, cx, cy, inner / 2f - d(6f))
 
         // 敌我连线 + 距离标签
         if (showLines) {
@@ -245,41 +265,41 @@ class EspCanvasView(
         for (a in frame.actors) {
             val ax = mapX(a.x)
             val ay = mapY(a.z)
-            if (ax < pad - 4f || ax > size - pad + 4f) continue
-            if (ay < pad - 4f || ay > size - pad + 4f) continue
+            if (ax < pad - d(4f) || ax > size - pad + d(4f)) continue
+            if (ay < pad - d(4f) || ay > size - pad + d(4f)) continue
             when {
                 a.isHero -> {
                     drawHero(canvas, a, ax, ay, now, heroIdx)
                     heroIdx++
                 }
                 a.isTower -> drawTower(canvas, ax, ay, a.visible)
-                a.isMonster -> drawDot(canvas, ax, ay, C_MONSTER, 5f, a.visible)
-                else -> drawDot(canvas, ax, ay, C_MINION, 3f, a.visible)
+                a.isMonster -> drawDot(canvas, ax, ay, C_MONSTER, d(5f), a.visible)
+                else -> drawDot(canvas, ax, ay, C_MINION, d(3f), a.visible)
             }
         }
 
         // 自己
         paintDot.style = Paint.Style.FILL
         paintDot.color = C_SELF
-        paintDot.setShadowLayer(10f, 0f, 0f, C_SELF)
-        canvas.drawCircle(cx, cy, 5.5f, paintDot)
+        paintDot.setShadowLayer(d(10f), 0f, 0f, C_SELF)
+        canvas.drawCircle(cx, cy, d(5.5f), paintDot)
         paintDot.clearShadowLayer()
-        paintArc.strokeWidth = 2f
+        paintArc.strokeWidth = d(2f)
         paintArc.color = C_ACCENT
-        rectTmp.set(cx - 10f, cy - 10f, cx + 10f, cy + 10f)
+        rectTmp.set(cx - d(10f), cy - d(10f), cx + d(10f), cy + d(10f))
         canvas.drawArc(rectTmp, 0f, 360f, false, paintArc)
     }
 
     private fun drawHero(canvas: Canvas, a: EspActor, x: Float, y: Float, now: Long, idx: Int) {
         val color = if (a.ally) C_ALLY else C_ENEMY
         val alpha = if (a.visible) 255 else 110
-        val r = 7f
+        val r = d(7f)
 
         // 敌方脉冲圈
         if (!a.ally && a.visible) {
             val phase = (now % 1200f) / 1200f
-            val pr = r + 6f + 5f * sin(phase * TAU + idx)
-            paintArc.strokeWidth = 2f
+            val pr = r + d(6f) + d(5f) * sin(phase * TAU + idx)
+            paintArc.strokeWidth = d(2f)
             paintArc.color = Color.argb(120, 255, 59, 71)
             rectTmp.set(x - pr, y - pr, x + pr, y + pr)
             canvas.drawArc(rectTmp, 0f, 360f, false, paintArc)
@@ -288,15 +308,15 @@ class EspCanvasView(
         // 本体 (辉光)
         paintDot.style = Paint.Style.FILL
         paintDot.color = withAlpha(color, alpha)
-        if (a.visible) paintDot.setShadowLayer(9f, 0f, 0f, color)
+        if (a.visible) paintDot.setShadowLayer(d(9f), 0f, 0f, color)
         canvas.drawCircle(x, y, r, paintDot)
         paintDot.clearShadowLayer()
 
         // 血量弧
         if (showHp && a.maxHp > 0) {
             val ratio = a.hpRatio.coerceIn(0f, 1f)
-            val arcR = r + 4.5f
-            paintArc.strokeWidth = 3f
+            val arcR = r + d(4.5f)
+            paintArc.strokeWidth = d(3f)
             paintArc.color = when {
                 ratio > 0.55f -> Color.argb(230, 61, 220, 132)
                 ratio > 0.28f -> Color.argb(230, 255, 179, 0)
@@ -308,8 +328,8 @@ class EspCanvasView(
 
         // 大招环
         if (showUlt) {
-            val ultR = r + 9.5f
-            paintArc.strokeWidth = 2f
+            val ultR = r + d(9.5f)
+            paintArc.strokeWidth = d(2f)
             if (a.ultimateReady || a.ultimateCooldown <= 0f) {
                 paintArc.color = C_GOLD
                 rectTmp.set(x - ultR, y - ultR, x + ultR, y + ultR)
@@ -325,24 +345,24 @@ class EspCanvasView(
         // 召唤师技能
         if (showSkills && a.summonerSpells.isNotEmpty()) {
             val spells = a.summonerSpells.take(2)
-            val pipY = y + r + 10f
-            var px = x - (spells.size - 1) * 6f
+            val pipY = y + r + d(10f)
+            var px = x - (spells.size - 1) * d(6f)
             for (s in spells) {
                 paintDot.color = if (s.ready || s.cooldownRemaining <= 0f) {
                     C_ACCENT
                 } else {
                     Color.argb(160, 110, 125, 145)
                 }
-                canvas.drawCircle(px, pipY, 3f, paintDot)
-                px += 12f
+                canvas.drawCircle(px, pipY, d(3f), paintDot)
+                px += d(12f)
             }
         }
 
         // 朝向
         if (showFacing && a.facingAngle != 0f) {
             val rad = Math.toRadians(a.facingAngle.toDouble()).toFloat()
-            val len = 15f
-            paintArc.strokeWidth = 2f
+            val len = d(15f)
+            paintArc.strokeWidth = d(2f)
             paintArc.color = withAlpha(color, 190)
             canvas.drawLine(x, y, x + len * sin(rad), y - len * cos(rad), paintArc)
         }
@@ -350,15 +370,15 @@ class EspCanvasView(
         // 等级 (仅敌方, 减少视觉噪音)
         if (showLevels && !a.ally) {
             paintTextSmall.color = Color.argb(235, 255, 200, 205)
-            drawChip(canvas, "Lv${a.level}", x + r + 16f, y - r - 10f,
+            drawChip(canvas, "Lv${a.level}", x + r + d(16f), y - r - d(10f),
                 paintTextSmall, Color.argb(170, 40, 12, 16), 0)
         }
     }
 
     private fun drawTower(canvas: Canvas, x: Float, y: Float, visible: Boolean) {
-        paintBracket.strokeWidth = 2f
+        paintBracket.strokeWidth = d(2f)
         paintBracket.color = withAlpha(C_TOWER, if (visible) 235 else 110)
-        rectTmp.set(x - 5.5f, y - 5.5f, x + 5.5f, y + 5.5f)
+        rectTmp.set(x - d(5.5f), y - d(5.5f), x + d(5.5f), y + d(5.5f))
         canvas.drawRect(rectTmp, paintBracket)
     }
 
@@ -381,8 +401,8 @@ class EspCanvasView(
     }
 
     private fun drawCornerTicks(canvas: Canvas, size: Float) {
-        val len = 14f
-        val o = 2f
+        val len = d(14f)
+        val o = d(2f)
         val s = size - o
         paintTick.color = C_ACCENT
         canvas.drawLine(o, o + len, o, o, paintTick)
@@ -400,22 +420,19 @@ class EspCanvasView(
         val w = mapSize.toFloat()
         val h = timerPanelHeight(timers.size).toFloat()
         paintBg.color = C_GLASS
-        rectTmp.set(0f, top + 6f, w, top + 6f + h)
-        canvas.drawRoundRect(rectTmp, 12f, 12f, paintBg)
-        canvas.drawRoundRect(rectTmp, 12f, 12f, paintBorder)
+        rectTmp.set(0f, top + d(6f), w, top + d(6f) + h)
+        canvas.drawRoundRect(rectTmp, d(12f), d(12f), paintBg)
+        canvas.drawRoundRect(rectTmp, d(12f), d(12f), paintBorder)
 
-        val padX = 12f
+        val padX = d(12f)
         paintText.color = C_GOLD
-        paintText.textSize = 14f
-        canvas.drawText("⚡ 资源计时", padX, top + 30f, paintText)
+        canvas.drawText("⚡ 资源计时", padX, top + d(30f), paintText)
 
-        var y = top + 48f
+        var y = top + d(48f)
         for (t in timers) {
-            paintTextDim.textSize = 12f
             paintTextDim.color = C_TEXT
-            canvas.drawText(t.label, padX, y + 10f, paintTextDim)
+            canvas.drawText(t.label, padX, y + d(10f), paintTextDim)
 
-            paintTextSmall.textSize = 12f
             val timeStr: String
             val timeColor: Int
             if (t.active) {
@@ -427,7 +444,7 @@ class EspCanvasView(
                 timeColor = C_ALLY
             }
             paintTextSmall.color = timeColor
-            canvas.drawText(timeStr, w - padX - paintTextSmall.measureText(timeStr), y + 10f, paintTextSmall)
+            canvas.drawText(timeStr, w - padX - paintTextSmall.measureText(timeStr), y + d(10f), paintTextSmall)
 
             // 进度条
             val barL = padX
@@ -435,15 +452,15 @@ class EspCanvasView(
             val barW = barR - barL
             paintChipBg.style = Paint.Style.FILL
             paintChipBg.color = Color.argb(120, 24, 32, 44)
-            rectTmp.set(barL, y + 16f, barR, y + 21f)
-            canvas.drawRoundRect(rectTmp, 2.5f, 2.5f, paintChipBg)
+            rectTmp.set(barL, y + d(16f), barR, y + d(21f))
+            canvas.drawRoundRect(rectTmp, d(2.5f), d(2.5f), paintChipBg)
             val ratio = t.ratio.coerceIn(0f, 1f)
             if (ratio > 0f) {
                 paintChipBg.color = Color.argb(220, 255, 179, 0)
-                rectTmp.set(barL, y + 16f, barL + barW * ratio, y + 21f)
-                canvas.drawRoundRect(rectTmp, 2.5f, 2.5f, paintChipBg)
+                rectTmp.set(barL, y + d(16f), barL + barW * ratio, y + d(21f))
+                canvas.drawRoundRect(rectTmp, d(2.5f), d(2.5f), paintChipBg)
             }
-            y += 36f
+            y += d(36f)
         }
     }
 
@@ -452,42 +469,45 @@ class EspCanvasView(
         val size = mapSize.toFloat()
         paintBg.color = C_GLASS
         rectTmp.set(0f, 0f, size, size)
-        canvas.drawRoundRect(rectTmp, 12f, 12f, paintBg)
-        canvas.drawRoundRect(rectTmp, 12f, 12f, paintBorder)
+        canvas.drawRoundRect(rectTmp, d(12f), d(12f), paintBg)
+        canvas.drawRoundRect(rectTmp, d(12f), d(12f), paintBorder)
         drawCornerTicks(canvas, size)
 
         val cx = size / 2f
-        val cy = size / 2f - 14f
+        val cy = size / 2f - d(14f)
         val phase = (SystemClock.elapsedRealtime() % 1400f) / 1400f
-        val pr = 10f + 8f * sin(phase * TAU)
-        paintArc.strokeWidth = 2.5f
+        val pr = d(10f) + d(8f) * sin(phase * TAU)
+        paintArc.strokeWidth = d(2.5f)
         paintArc.color = C_ACCENT
         rectTmp.set(cx - pr, cy - pr, cx + pr, cy + pr)
         canvas.drawArc(rectTmp, 0f, 360f, false, paintArc)
         paintDot.style = Paint.Style.FILL
         paintDot.color = C_ACCENT
-        canvas.drawCircle(cx, cy, 4f, paintDot)
+        canvas.drawCircle(cx, cy, d(4f), paintDot)
 
         paintText.color = C_TEXT
-        paintText.textSize = 16f
         val t1 = "等待对局数据"
-        canvas.drawText(t1, cx - paintText.measureText(t1) / 2f, cy + 44f, paintText)
-        paintTextDim.textSize = 12f
+        canvas.drawText(t1, cx - paintText.measureText(t1) / 2f, cy + d(44f), paintText)
         val t2 = "部署读取器 · 进入对局后生效"
-        canvas.drawText(t2, cx - paintTextDim.measureText(t2) / 2f, cy + 66f, paintTextDim)
+        canvas.drawText(t2, cx - paintTextDim.measureText(t2) / 2f, cy + d(66f), paintTextDim)
     }
 
     // ==================== 芯片 ====================
+    private fun chipWidth(text: String, tPaint: Paint): Float =
+        tPaint.measureText(text) + d(10f)
+
+    /** 绘制芯片。默认 x 为中心; startAlign=true 时 x 为左缘并返回右缘 (用于横排布局)。 */
     private fun drawChip(
         canvas: Canvas, text: String, cx: Float, cy: Float,
-        tPaint: Paint, bg: Int, stroke: Int = 0
-    ) {
+        tPaint: Paint, bg: Int, stroke: Int = 0, startAlign: Boolean = false
+    ): Float {
         val tw = tPaint.measureText(text)
-        val ph = 5f
-        val pv = 2.5f
+        val ph = d(5f)
+        val pv = d(2.5f)
         val h = tPaint.textSize + pv * 2f
         val w = tw + ph * 2f
-        chipRect.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
+        val left = if (startAlign) cx else cx - w / 2f
+        chipRect.set(left, cy - h / 2f, left + w, cy + h / 2f)
         paintChipBg.style = Paint.Style.FILL
         paintChipBg.color = bg
         canvas.drawRoundRect(chipRect, h / 2f, h / 2f, paintChipBg)
@@ -496,7 +516,8 @@ class EspCanvasView(
             canvas.drawRoundRect(chipRect, h / 2f, h / 2f, paintChipStroke)
         }
         val fm = tPaint.fontMetrics
-        canvas.drawText(text, cx - tw / 2f, cy - (fm.ascent + fm.descent) / 2f, tPaint)
+        canvas.drawText(text, left + ph, cy - (fm.ascent + fm.descent) / 2f, tPaint)
+        return left + w
     }
 }
 

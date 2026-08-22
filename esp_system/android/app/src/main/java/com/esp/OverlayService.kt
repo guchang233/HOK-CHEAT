@@ -20,12 +20,14 @@ import android.os.SystemClock
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import kotlin.math.abs
 
 class OverlayService : Service() {
 
@@ -94,11 +96,13 @@ class OverlayService : Service() {
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-        radarSize = prefs.getInt("radar", 300).coerceIn(200, 640)
-
         val view = EspCanvasView(this)
-        view.setMapSize(radarSize)
         espView = view
+
+        // 雷达尺寸以 dp 为存储单位, 换算 px (高密度屏不至于过小)
+        val radarDp = prefs.getInt("radar", 300).coerceIn(200, 640)
+        radarSize = HudUi.dp(this, radarDp.toFloat()).toInt()
+        view.setMapSize(radarSize)
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -238,7 +242,7 @@ class OverlayService : Service() {
             minimumWidth = HudUi.dp(ctx, 244f).toInt()
         }
 
-        // 头部: 状态点 + 标题 + 折叠
+        // 头部: 拖拽手柄 + 状态点 + 标题 + 折叠
         val dotDrawable = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(Color.argb(255, 120, 140, 160))
@@ -249,10 +253,17 @@ class OverlayService : Service() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
+        header.addView(TextView(ctx).apply {
+            text = "≡"
+            textSize = 14f
+            setTextColor(HudUi.TEXT_DIM)
+        })
         val dotSize = HudUi.dp(ctx, 8f).toInt()
         header.addView(View(ctx).apply {
             background = dotDrawable
-            layoutParams = LinearLayout.LayoutParams(dotSize, dotSize)
+            layoutParams = LinearLayout.LayoutParams(dotSize, dotSize).apply {
+                marginStart = HudUi.dp(ctx, 8f).toInt()
+            }
         })
         header.addView(TextView(ctx).apply {
             text = "ESP 透视"
@@ -426,12 +437,11 @@ class OverlayService : Service() {
                 HudUi.dp(ctx, 14f).toInt(), HudUi.dp(ctx, 6f).toInt()
             )
             visibility = View.GONE
-            setOnClickListener { setCollapsed(false) }
         }
         root.addView(mini, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.END or Gravity.CENTER_VERTICAL
+            Gravity.CENTER
         ))
         miniPillView = mini
         panelScroll = scroll
@@ -443,6 +453,7 @@ class OverlayService : Service() {
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
         }
+        val dm = resources.displayMetrics
         val tbLp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -451,8 +462,17 @@ class OverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            x = -HudUi.dp(ctx, 8f).toInt()
+            gravity = Gravity.TOP or Gravity.START
+            val sx = prefs.getInt("tb_x", -1)
+            val sy = prefs.getInt("tb_y", -1)
+            if (sx >= 0 && sy >= 0) {
+                x = sx.coerceIn(0, dm.widthPixels)
+                y = sy.coerceIn(0, dm.heightPixels)
+            } else {
+                // 默认停靠右侧、垂直 1/3 处
+                x = (dm.widthPixels - HudUi.dp(ctx, 250f)).toInt()
+                y = dm.heightPixels / 4
+            }
         }
         toolbarParams = tbLp
         toolbarRoot = root
@@ -462,6 +482,102 @@ class OverlayService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "工具栏挂载失败", e)
             return
+        }
+
+        // 头部拖拽移动 (≡ 手柄区域) + 双击折叠/展开
+        var downRawX = 0f
+        var downRawY = 0f
+        var lpStartX = 0
+        var lpStartY = 0
+        var dragMoved = false
+        var lastTapMs = 0L
+        val maxTbX = dm.widthPixels - HudUi.dp(ctx, 60f).toInt()
+        val maxTbY = dm.heightPixels - HudUi.dp(ctx, 40f).toInt()
+        header.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = ev.rawX
+                    downRawY = ev.rawY
+                    lpStartX = tbLp.x
+                    lpStartY = tbLp.y
+                    dragMoved = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (ev.rawX - downRawX).toInt()
+                    val dy = (ev.rawY - downRawY).toInt()
+                    if (!dragMoved && (abs(dx) > 5 || abs(dy) > 5)) dragMoved = true
+                    if (dragMoved) {
+                        tbLp.x = (lpStartX + dx).coerceIn(0, maxTbX)
+                        tbLp.y = (lpStartY + dy).coerceIn(0, maxTbY)
+                        try {
+                            windowManager.updateViewLayout(root, tbLp)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (dragMoved) {
+                        prefs.edit().putInt("tb_x", tbLp.x).putInt("tb_y", tbLp.y).apply()
+                    } else {
+                        // 双击标题区折叠/展开
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastTapMs < 300) {
+                            setCollapsed(!collapsed)
+                            lastTapMs = 0L
+                        } else {
+                            lastTapMs = now
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
+
+        // 迷你胶囊: 点按展开, 拖拽移动
+        var miniDownX = 0f
+        var miniDownY = 0f
+        var miniLpX = 0
+        var miniLpY = 0
+        var miniMoved = false
+        mini.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    miniDownX = ev.rawX
+                    miniDownY = ev.rawY
+                    miniLpX = tbLp.x
+                    miniLpY = tbLp.y
+                    miniMoved = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (ev.rawX - miniDownX).toInt()
+                    val dy = (ev.rawY - miniDownY).toInt()
+                    if (!miniMoved && (abs(dx) > 5 || abs(dy) > 5)) miniMoved = true
+                    if (miniMoved) {
+                        tbLp.x = (miniLpX + dx).coerceIn(0, maxTbX)
+                        tbLp.y = (miniLpY + dy).coerceIn(0, maxTbY)
+                        try {
+                            windowManager.updateViewLayout(root, tbLp)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (miniMoved) {
+                        prefs.edit().putInt("tb_x", tbLp.x).putInt("tb_y", tbLp.y).apply()
+                    } else {
+                        setCollapsed(false)
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
         }
 
         // 状态点呼吸动画
@@ -498,10 +614,13 @@ class OverlayService : Service() {
         mainHandler?.post(runnable)
     }
 
-    private fun adjustRadar(delta: Int) {
-        radarSize = (radarSize + delta).coerceIn(200, 640)
+    private fun adjustRadar(deltaDp: Int) {
+        // radarSize 为 px; 存储与步进以 dp 为单位
+        val curDp = (radarSize / resources.displayMetrics.density).toInt()
+        val newDp = (curDp + deltaDp).coerceIn(200, 640)
+        radarSize = HudUi.dp(this, newDp.toFloat()).toInt()
         espView?.setMapSize(radarSize)
-        prefs.edit().putInt("radar", radarSize).apply()
+        prefs.edit().putInt("radar", newDp).apply()
     }
 
     private fun setCollapsed(v: Boolean) {

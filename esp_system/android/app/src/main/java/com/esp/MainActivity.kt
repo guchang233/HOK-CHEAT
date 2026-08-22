@@ -28,7 +28,8 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(HudUi.BG_APP)
-            setPadding(48, 72, 48, 48)
+            val p = HudUi.dp(ctx, 20f).toInt()
+            setPadding(p, HudUi.dp(ctx, 32f).toInt(), p, p)
         }
 
         // 标题
@@ -43,7 +44,7 @@ class MainActivity : AppCompatActivity() {
             text = "战术雷达 · 悬浮 HUD · TVEF v2"
             textSize = 13f
             setTextColor(HudUi.TEXT_DIM)
-            setPadding(0, 6, 0, 0)
+            setPadding(0, HudUi.dp(ctx, 4f).toInt(), 0, 0)
         })
 
         // 状态卡
@@ -55,7 +56,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = 36 }
+            ).apply { topMargin = HudUi.dp(ctx, 24f).toInt() }
         }
 
         val statusView = TextView(ctx).apply {
@@ -69,7 +70,7 @@ class MainActivity : AppCompatActivity() {
         fun fullLp() = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = 14 }
+        ).apply { topMargin = HudUi.dp(ctx, 12f).toInt() }
 
         card.addView(HudUi.primaryButton(ctx, "启动透视悬浮窗") {
             if (checkPermissions()) {
@@ -99,16 +100,17 @@ class MainActivity : AppCompatActivity() {
             textSize = 11f
             setTextColor(HudUi.TEXT_DIM)
             letterSpacing = 0.12f
-            setPadding(0, 24, 0, 8)
+            setPadding(0, HudUi.dp(ctx, 18f).toInt(), 0, HudUi.dp(ctx, 6f).toInt())
         })
         card.addView(TextView(ctx).apply {
             text = "1. 点「启动透视悬浮窗」，首次需授予悬浮窗权限\n" +
                 "2. 悬浮窗工具栏点「部署」，首次需 Root 授权（仅一次）\n" +
                 "3. 启动游戏进入对局，雷达自动显示敌我位置\n" +
-                "4. 工具栏「—」可折叠为迷你胶囊，点胶囊恢复"
+                "4. 拖动工具栏顶部「≡」可移动位置，双击标题折叠\n" +
+                "5. 折叠后迷你胶囊可拖动，点按恢复完整面板"
             textSize = 13f
             setTextColor(HudUi.TEXT_MAIN)
-            lineSpacingExtra = 6f
+            setLineSpacing(HudUi.dp(ctx, 3f), 1f)
         })
 
         root.addView(card)
@@ -119,7 +121,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 11f
             setTextColor(HudUi.TEXT_DIM)
             gravity = Gravity.CENTER
-            setPadding(0, 28, 0, 0)
+            setPadding(0, HudUi.dp(ctx, 20f).toInt(), 0, 0)
         })
 
         setContentView(root)
