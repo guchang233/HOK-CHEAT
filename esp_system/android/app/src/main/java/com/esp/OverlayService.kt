@@ -1,5 +1,6 @@
 package com.esp
 
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,15 +10,21 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 class OverlayService : Service() {
@@ -32,14 +39,23 @@ class OverlayService : Service() {
     private var toolbarView: View? = null
     private var toolbarParams: WindowManager.LayoutParams? = null
 
+    // HUD 引用
+    private var toolbarRoot: FrameLayout? = null
+    private var panelScroll: ScrollView? = null
+    private var miniPillView: TextView? = null
+    private var collapsed = false
+    private var radarSize = 300
+    private var mainHandler: Handler? = null
+    private var statusRunnable: Runnable? = null
+    private var pulseAnim: ValueAnimator? = null
+    private var statusDotDrawable: GradientDrawable? = null
+
     private val TAG = "ESP-Overlay"
     private val CHANNEL_ID = "esp_overlay"
     private val NOTIF_ID = 1
 
     companion object {
         const val ACTION_STOP = "com.esp.STOP_OVERLAY"
-        const val ACTION_TOGGLE_MAP = "com.esp.TOGGLE_MAP"
-        const val ACTION_TOGGLE_BOX = "com.esp.TOGGLE_BOX"
         const val ACTION_CENTER = "com.esp.CENTER"
         const val ACTION_DEPLOY_READER = "com.esp.DEPLOY_READER"
         const val ACTION_STOP_READER = "com.esp.STOP_READER"
@@ -49,19 +65,27 @@ class OverlayService : Service() {
         const val READER_PORT_DEFAULT = 47291
 
         @Volatile var isRunning = false
-        @Volatile var showMinimap = true
-        @Volatile var showBoxes = true
-        @Volatile var showSkills = true
-        @Volatile var showUltimate = true
+
+        // 显示开关
+        @Volatile var showRadar = true
         @Volatile var showLines = true
+        @Volatile var showHp = true
+        @Volatile var showSkills = true
+        @Volatile var showUlt = true
         @Volatile var showTimers = true
+        @Volatile var showLevels = true
+        @Volatile var showDist = true
         @Volatile var showFacing = true
-        @Volatile var showNameLevel = true
+
         @Volatile var lastLog = ""
         @Volatile var readerStatus = "未部署"
-    }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+        // 实时状态 (读取线程写, UI 线程读)
+        @Volatile var readerConnected = false
+        @Volatile var fps = 0
+        @Volatile var enemyAlive = 0
+        @Volatile var allyAlive = 0
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -70,7 +94,10 @@ class OverlayService : Service() {
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
+        radarSize = prefs.getInt("radar", 300).coerceIn(200, 640)
+
         val view = EspCanvasView(this)
+        view.setMapSize(radarSize)
         espView = view
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -80,7 +107,6 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
-        val savedSize = prefs.getInt("size", 300).coerceIn(140, 600)
         val savedX = prefs.getInt("x", 32)
         val savedY = prefs.getInt("y", 100)
 
@@ -99,82 +125,41 @@ class OverlayService : Service() {
             y = savedY
         }
         params = lp
-
-        view.setOnTouchListener(buildDragListener(view, lp))
         windowManager.addView(view, lp)
 
+        // 读取器数据回调 + 实时统计
+        var frames = 0
+        var lastMs = 0L
         ReaderClient.start { status ->
             view.updateFrame(status.frame)
+            readerConnected = status.connected
+            val f = status.frame
+            if (f != null) {
+                enemyAlive = f.actors.count { !it.ally && it.isHero }
+                allyAlive = f.actors.count { it.ally && it.isHero }
+                frames++
+                val now = SystemClock.elapsedRealtime()
+                if (lastMs == 0L) lastMs = now
+                val dt = now - lastMs
+                if (dt >= 1000) {
+                    fps = (frames * 1000f / dt).toInt()
+                    frames = 0
+                    lastMs = now
+                }
+            }
         }
 
         showToolbar()
     }
 
-    private fun buildDragListener(view: View, lp: WindowManager.LayoutParams): View.OnTouchListener {
-        var initX = 0
-        var initY = 0
-        var touchX = 0f
-        var touchY = 0f
-
-        return View.OnTouchListener { _, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    initX = lp.x
-                    initY = lp.y
-                    touchX = event.rawX
-                    touchY = event.rawY
-                    enableTouch(lp, view)
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - touchX).toInt()
-                    val dy = (event.rawY - touchY).toInt()
-                    lp.x = initX + dx
-                    lp.y = initY + dy
-                    try { windowManager.updateViewLayout(view, lp) } catch (_: Exception) {}
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    disableTouch(lp, view)
-                    true
-                }
-                else -> false
-            }
-        }
-    }
-
-    private fun enableTouch(lp: WindowManager.LayoutParams, view: View) {
-        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        try { windowManager.updateViewLayout(view, lp) } catch (_: Exception) {}
-    }
-
-    private fun disableTouch(lp: WindowManager.LayoutParams, view: View) {
-        lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        try { windowManager.updateViewLayout(view, lp) } catch (_: Exception) {}
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> { stopSelf(); return START_NOT_STICKY }
-            ACTION_TOGGLE_MAP -> {
-                showMinimap = !showMinimap
-                espView?.setShowMinimap(showMinimap)
+            ACTION_STOP -> {
+                stopSelf()
+                return START_NOT_STICKY
             }
-            ACTION_TOGGLE_BOX -> {
-                showBoxes = !showBoxes
-                espView?.setShowBoxes(showBoxes)
-            }
-            ACTION_CENTER -> {
-                params?.let { p ->
-                    val dm = resources.displayMetrics
-                    p.x = (dm.widthPixels / 2 - 150).toInt()
-                    p.y = (dm.heightPixels / 2 - 150).toInt()
-                    try { windowManager.updateViewLayout(espView, p) } catch (_: Exception) {}
-                }
-            }
-            ACTION_DEPLOY_READER -> {
-                deployAndStartReader()
-            }
+            ACTION_CENTER -> centerRadar()
+            ACTION_DEPLOY_READER -> deployAndStartReader()
             ACTION_STOP_READER -> {
                 RootHelper.stopReader()
                 readerStatus = "读取器已停止"
@@ -187,6 +172,351 @@ class OverlayService : Service() {
         return START_STICKY
     }
 
+    private fun centerRadar() {
+        val p = params ?: return
+        val v = espView ?: return
+        val dm = resources.displayMetrics
+        p.x = (dm.widthPixels - v.width) / 2
+        p.y = (dm.heightPixels - v.height) / 2
+        prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
+        try {
+            windowManager.updateViewLayout(v, p)
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun onDestroy() {
+        isRunning = false
+        statusRunnable?.let { mainHandler?.removeCallbacks(it) }
+        pulseAnim?.cancel()
+        ReaderClient.stop()
+        RootHelper.killShell()
+        espView?.let {
+            try {
+                windowManager.removeView(it)
+            } catch (_: Exception) {
+            }
+        }
+        toolbarView?.let {
+            try {
+                windowManager.removeView(it)
+            } catch (_: Exception) {
+            }
+        }
+        espView = null
+        toolbarView = null
+        toolbarRoot = null
+        panelScroll = null
+        miniPillView = null
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun sendServiceAction(action: String) {
+        val intent = Intent(this, OverlayService::class.java)
+        intent.action = action
+        startService(intent)
+    }
+
+    // ==================== 工具栏 (战术玻璃 HUD) ====================
+    private fun showToolbar() {
+        if (toolbarView != null) return
+        val ctx = this
+        mainHandler = Handler(Looper.getMainLooper())
+
+        val root = FrameLayout(ctx)
+
+        // ---------- 完整面板 ----------
+        val panel = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = HudUi.panelBg(ctx, 16f)
+            setPadding(
+                HudUi.dp(ctx, 12f).toInt(), HudUi.dp(ctx, 10f).toInt(),
+                HudUi.dp(ctx, 12f).toInt(), HudUi.dp(ctx, 12f).toInt()
+            )
+            minimumWidth = HudUi.dp(ctx, 244f).toInt()
+        }
+
+        // 头部: 状态点 + 标题 + 折叠
+        val dotDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.argb(255, 120, 140, 160))
+        }
+        statusDotDrawable = dotDrawable
+
+        val header = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val dotSize = HudUi.dp(ctx, 8f).toInt()
+        header.addView(View(ctx).apply {
+            background = dotDrawable
+            layoutParams = LinearLayout.LayoutParams(dotSize, dotSize)
+        })
+        header.addView(TextView(ctx).apply {
+            text = "ESP 透视"
+            textSize = 14f
+            setTextColor(HudUi.TEXT_MAIN)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = HudUi.dp(ctx, 8f).toInt() }
+        })
+        header.addView(View(ctx), LinearLayout.LayoutParams(0, 1, 1f))
+        header.addView(HudUi.actionButton(ctx, "—") { setCollapsed(!collapsed) })
+        panel.addView(header)
+
+        // 分隔线
+        panel.addView(View(ctx).apply {
+            setBackgroundColor(HudUi.STROKE_DIM)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, HudUi.dp(ctx, 1f).toInt()
+            ).apply { topMargin = HudUi.dp(ctx, 8f).toInt() }
+        })
+
+        // 状态芯片行
+        fun chip(initial: String): TextView = TextView(ctx).apply {
+            text = initial
+            textSize = 10f
+            setTextColor(HudUi.TEXT_MAIN)
+            typeface = Typeface.DEFAULT_BOLD
+            background = HudUi.chipBg(ctx)
+            setPadding(
+                HudUi.dp(ctx, 8f).toInt(), HudUi.dp(ctx, 3f).toInt(),
+                HudUi.dp(ctx, 8f).toInt(), HudUi.dp(ctx, 3f).toInt()
+            )
+        }
+        fun chipLp() = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { marginEnd = HudUi.dp(ctx, 6f).toInt() }
+
+        val tvReader = chip("读取器 --")
+        val tvFps = chip("FPS --")
+        val tvCount = chip("敌 - / 我 -")
+        val chipRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, HudUi.dp(ctx, 8f).toInt(), 0, 0)
+        }
+        chipRow.addView(tvReader, chipLp())
+        chipRow.addView(tvFps, chipLp())
+        chipRow.addView(tvCount, chipLp())
+        panel.addView(chipRow)
+
+        val tvStatusFull = TextView(ctx).apply {
+            text = readerStatus
+            textSize = 10f
+            setTextColor(HudUi.TEXT_DIM)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, HudUi.dp(ctx, 4f).toInt(), 0, 0)
+        }
+        panel.addView(tvStatusFull)
+
+        // 动作按钮行
+        fun actionRow(): LinearLayout = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, HudUi.dp(ctx, 8f).toInt(), 0, 0)
+        }
+        fun weightLp() = LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+        ).apply { marginEnd = HudUi.dp(ctx, 6f).toInt() }
+        fun lastWeightLp() = LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+        )
+
+        val rowA = actionRow()
+        rowA.addView(HudUi.actionButton(ctx, "部署") {
+            readerStatus = "部署中..."
+            sendServiceAction(ACTION_DEPLOY_READER)
+        }, weightLp())
+        rowA.addView(HudUi.actionButton(ctx, "日志") {
+            sendServiceAction(ACTION_LOG_READER)
+        }, weightLp())
+        rowA.addView(HudUi.actionButton(ctx, "居中") {
+            sendServiceAction(ACTION_CENTER)
+        }, lastWeightLp())
+        panel.addView(rowA)
+
+        val rowB = actionRow()
+        rowB.addView(HudUi.actionButton(ctx, "雷达 −") {
+            adjustRadar(-40)
+        }, weightLp())
+        rowB.addView(HudUi.actionButton(ctx, "雷达 ＋") {
+            adjustRadar(40)
+        }, weightLp())
+        rowB.addView(HudUi.dangerButton(ctx, "停止读取器") {
+            sendServiceAction(ACTION_STOP_READER)
+        }, lastWeightLp())
+        panel.addView(rowB)
+
+        // 开关区
+        panel.addView(TextView(ctx).apply {
+            text = "战场显示"
+            textSize = 10f
+            setTextColor(HudUi.TEXT_DIM)
+            letterSpacing = 0.12f
+            setPadding(0, HudUi.dp(ctx, 10f).toInt(), 0, HudUi.dp(ctx, 4f).toInt())
+        })
+
+        fun toggleRow(a: PillToggle, b: PillToggle?): LinearLayout {
+            val r = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, HudUi.dp(ctx, 2f).toInt(), 0, HudUi.dp(ctx, 2f).toInt())
+            }
+            r.addView(a, LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            if (b != null) {
+                r.addView(b, LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            return r
+        }
+
+        panel.addView(toggleRow(
+            PillToggle(ctx, "雷达", showRadar) { v -> showRadar = v; espView?.setRadar(v) },
+            PillToggle(ctx, "连线", showLines) { v -> showLines = v; espView?.setLines(v) }
+        ))
+        panel.addView(toggleRow(
+            PillToggle(ctx, "血量环", showHp) { v -> showHp = v; espView?.setHp(v) },
+            PillToggle(ctx, "技能", showSkills) { v -> showSkills = v; espView?.setSkills(v) }
+        ))
+        panel.addView(toggleRow(
+            PillToggle(ctx, "大招", showUlt) { v -> showUlt = v; espView?.setUlt(v) },
+            PillToggle(ctx, "计时", showTimers) { v -> showTimers = v; espView?.setTimers(v) }
+        ))
+        panel.addView(toggleRow(
+            PillToggle(ctx, "等级", showLevels) { v -> showLevels = v; espView?.setLevels(v) },
+            PillToggle(ctx, "距离", showDist) { v -> showDist = v; espView?.setDist(v) }
+        ))
+        panel.addView(toggleRow(
+            PillToggle(ctx, "朝向", showFacing) { v -> showFacing = v; espView?.setFacing(v) },
+            null
+        ))
+
+        // 停止按钮
+        panel.addView(HudUi.dangerButton(ctx, "⏹ 停止透视") {
+            stopSelf()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = HudUi.dp(ctx, 12f).toInt() }
+        })
+
+        val scroll = ScrollView(ctx).apply { isVerticalScrollBarEnabled = false }
+        scroll.addView(panel)
+        root.addView(scroll)
+
+        // ---------- 迷你胶囊 ----------
+        val mini = TextView(ctx).apply {
+            text = "ESP"
+            textSize = 12f
+            setTextColor(HudUi.TEXT_MAIN)
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(HudUi.BG_PANEL)
+                cornerRadius = HudUi.dp(ctx, 18f)
+                setStroke(HudUi.dp(ctx, 1f).toInt(), HudUi.STROKE_HOT)
+            }
+            setPadding(
+                HudUi.dp(ctx, 14f).toInt(), HudUi.dp(ctx, 6f).toInt(),
+                HudUi.dp(ctx, 14f).toInt(), HudUi.dp(ctx, 6f).toInt()
+            )
+            visibility = View.GONE
+            setOnClickListener { setCollapsed(false) }
+        }
+        root.addView(mini, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.END or Gravity.CENTER_VERTICAL
+        ))
+        miniPillView = mini
+        panelScroll = scroll
+
+        // ---------- 挂载窗口 ----------
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        val tbLp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            x = -HudUi.dp(ctx, 8f).toInt()
+        }
+        toolbarParams = tbLp
+        toolbarRoot = root
+        try {
+            windowManager.addView(root, tbLp)
+            toolbarView = root
+        } catch (e: Exception) {
+            Log.w(TAG, "工具栏挂载失败", e)
+            return
+        }
+
+        // 状态点呼吸动画
+        pulseAnim = ValueAnimator.ofFloat(0.35f, 1f).apply {
+            duration = 650
+            repeatMode = ValueAnimator.REVERSE
+            repeatCount = ValueAnimator.INFINITE
+            addUpdateListener {
+                dotDrawable.alpha = (255 * (it.animatedValue as Float)).toInt()
+            }
+            start()
+        }
+
+        // 周期刷新状态芯片
+        val runnable = object : Runnable {
+            override fun run() {
+                tvReader.text = if (readerConnected) "读取器 ✓" else "读取器 ×"
+                tvReader.setTextColor(if (readerConnected) HudUi.ACCENT else HudUi.TEXT_DIM)
+                tvFps.text = "FPS $fps"
+                tvFps.setTextColor(if (fps > 0) HudUi.TEXT_MAIN else HudUi.TEXT_DIM)
+                tvCount.text = "敌 $enemyAlive / 我 $allyAlive"
+                tvStatusFull.text = readerStatus
+                statusDotDrawable?.setColor(
+                    when {
+                        readerConnected -> HudUi.ACCENT
+                        readerStatus.contains("失败") || readerStatus.contains("错误") -> HudUi.ENEMY
+                        else -> Color.argb(255, 120, 140, 160)
+                    }
+                )
+                mainHandler?.postDelayed(this, 500)
+            }
+        }
+        statusRunnable = runnable
+        mainHandler?.post(runnable)
+    }
+
+    private fun adjustRadar(delta: Int) {
+        radarSize = (radarSize + delta).coerceIn(200, 640)
+        espView?.setMapSize(radarSize)
+        prefs.edit().putInt("radar", radarSize).apply()
+    }
+
+    private fun setCollapsed(v: Boolean) {
+        collapsed = v
+        panelScroll?.visibility = if (v) View.GONE else View.VISIBLE
+        miniPillView?.visibility = if (v) View.VISIBLE else View.GONE
+        try {
+            val r = toolbarRoot ?: return
+            val lp = toolbarParams ?: return
+            windowManager.updateViewLayout(r, lp)
+        } catch (_: Exception) {
+        }
+    }
+
+    // ==================== 读取器部署 ====================
     private fun deployAndStartReader() {
         readerStatus = "部署中..."
         Thread {
@@ -225,226 +555,7 @@ class OverlayService : Service() {
         }.start()
     }
 
-    private fun showToolbar() {
-        if (toolbarView != null) return
-        val ctx = this
-
-        val scrollView = android.widget.ScrollView(ctx).apply {
-            isVerticalScrollBarEnabled = false
-        }
-
-        val ll = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(230, 15, 15, 20))
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            layoutParams = android.widget.FrameLayout.LayoutParams(
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-
-        val title = TextView(ctx).apply {
-            text = "🎮 ESP 透视"
-            setTextColor(Color.argb(220, 100, 220, 255))
-            textSize = 14f
-            setPadding(0, dp(2), 0, dp(4))
-        }
-        ll.addView(title)
-
-        val statusText = TextView(ctx).apply {
-            text = readerStatus
-            setTextColor(Color.argb(180, 180, 220, 180))
-            textSize = 10f
-            setPadding(0, 0, 0, dp(4))
-        }
-        ll.addView(statusText)
-
-        val row1 = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(2), 0, dp(2))
-        }
-        ll.addView(row1)
-
-        row1.addView(toolbarButton("部署") {
-            readerStatus = "部署中..."
-            statusText.text = readerStatus
-            sendServiceAction(ACTION_DEPLOY_READER)
-        })
-        row1.addView(toolbarButton("停止读取器") {
-            sendServiceAction(ACTION_STOP_READER)
-        })
-
-        val row2 = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(2), 0, dp(2))
-        }
-        ll.addView(row2)
-
-        row2.addView(toolbarButton("日志") {
-            sendServiceAction(ACTION_LOG_READER)
-            statusText.text = lastLog.take(60)
-        })
-        row2.addView(toolbarButton("居中") {
-            sendServiceAction(ACTION_CENTER)
-        })
-
-        addSectionLabel(ll, "── ESP 显示 ──")
-
-        val row3 = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        ll.addView(row3)
-        row3.addView(toggleButton("地图", showMinimap) { v ->
-            showMinimap = v; espView?.setShowMinimap(v)
-        })
-        row3.addView(toggleButton("方框", showBoxes) { v ->
-            showBoxes = v; espView?.setShowBoxes(v)
-        })
-        row3.addView(toggleButton("连线", showLines) { v ->
-            showLines = v; espView?.setShowLines(v)
-        })
-
-        val row4 = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        ll.addView(row4)
-        row4.addView(toggleButton("技能", showSkills) { v ->
-            showSkills = v; espView?.setShowSkills(v)
-        })
-        row4.addView(toggleButton("大招", showUltimate) { v ->
-            showUltimate = v; espView?.setShowUltimate(v)
-        })
-        row4.addView(toggleButton("计时", showTimers) { v ->
-            showTimers = v; espView?.setShowTimers(v)
-        })
-
-        val row5 = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        ll.addView(row5)
-        row5.addView(toggleButton("朝向", showFacing) { v ->
-            showFacing = v; espView?.setShowFacing(v)
-        })
-        row5.addView(toggleButton("等级", showNameLevel) { v ->
-            showNameLevel = v; espView?.setShowNameLevel(v)
-        })
-        row5.addView(toggleButton("距离", true) { v ->
-            espView?.setShowDistance(v)
-        })
-
-        val row6 = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        ll.addView(row6)
-        row6.addView(toggleButton("血条", true) { v ->
-            espView?.setShowHPRatio(v)
-        })
-
-        addSectionLabel(ll, "──────────────")
-
-        val stopBtn = toolbarButton("⏹ 停止透视") {
-            stopSelf()
-        }
-        ll.addView(stopBtn)
-
-        scrollView.addView(ll)
-
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
-        val tbLp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            x = -dp(10)
-            width = dp(200)
-        }
-        toolbarParams = tbLp
-
-        try {
-            windowManager.addView(scrollView, tbLp)
-            toolbarView = scrollView
-        } catch (_: Exception) {}
-    }
-
-    private fun addSectionLabel(parent: LinearLayout, text: String) {
-        val label = TextView(this).apply {
-            this.text = text
-            setTextColor(Color.argb(140, 150, 150, 180))
-            textSize = 10f
-            gravity = android.view.Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(2))
-        }
-        parent.addView(label)
-    }
-
-    private fun toggleButton(label: String, initial: Boolean, onChange: (Boolean) -> Unit): Button {
-        var state = initial
-        val btn = Button(this).apply {
-            text = "$label:${if (state) "ON" else "OFF"}"
-            textSize = 11f
-            minWidth = 0
-            minimumWidth = dp(50)
-            setPadding(dp(4), dp(2), dp(4), dp(2))
-            setBackgroundColor(Color.argb(
-                if (state) 200 else 100,
-                if (state) 50 else 100,
-                if (state) 180 else 100,
-                if (state) 100 else 100
-            ))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                state = !state
-                this.text = "$label:${if (state) "ON" else "OFF"}"
-                this.setBackgroundColor(Color.argb(
-                    if (state) 200 else 100,
-                    if (state) 50 else 100,
-                    if (state) 180 else 100,
-                    if (state) 100 else 100
-                ))
-                onChange(state)
-            }
-        }
-        return btn
-    }
-
-    private fun toolbarButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
-        text = label
-        textSize = 12f
-        minWidth = 0
-        minimumWidth = dp(56)
-        setPadding(dp(6), dp(2), dp(6), dp(2))
-        setOnClickListener { onClick() }
-    }
-
-    private fun sendServiceAction(action: String) {
-        val intent = Intent(this, OverlayService::class.java).apply { this.action = action }
-        startService(intent)
-    }
-
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
-
-    override fun onDestroy() {
-        params?.let { lp ->
-            prefs.edit().apply {
-                putInt("x", lp.x)
-                putInt("y", lp.y)
-                apply()
-            }
-        }
-        ReaderClient.stop()
-        toolbarView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        toolbarView = null
-        espView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        espView = null
-        isRunning = false
-        super.onDestroy()
-    }
-
+    // ==================== 前台服务 ====================
     private fun startInForeground() {
         val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -471,10 +582,8 @@ class OverlayService : Service() {
                 .setOngoing(true)
                 .build()
         }
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
+        startForeground(NOTIF_ID, notif)
     }
 }
+
+
