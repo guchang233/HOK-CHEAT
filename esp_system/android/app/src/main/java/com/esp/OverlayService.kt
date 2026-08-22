@@ -278,7 +278,8 @@ class OverlayService : Service() {
         statusRunnable?.let { mainHandler?.removeCallbacks(it) }
         pulseAnim?.cancel()
         ReaderClient.stop()
-        RootHelper.killShell()
+        // 注意: 不 kill Root shell — 服务重启时直接复用, su 授权弹窗只出现一次。
+        // shell 是本 app 的子进程, app 进程被杀时系统会自动回收它。
         espFullScreen?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
         }
