@@ -107,7 +107,8 @@ class MainActivity : AppCompatActivity() {
                 "2. 悬浮窗工具栏点「部署」，首次需 Root 授权（仅一次）\n" +
                 "3. 启动游戏进入对局，雷达自动显示敌我位置\n" +
                 "4. 拖动工具栏顶部「≡」可移动位置，双击标题折叠\n" +
-                "5. 折叠后迷你胶囊可拖动，点按恢复完整面板"
+                "5. 部署失败时点「日志」查看原因分析与环境诊断\n" +
+                "6. 日志同步落盘: Android/data/com.esp.overlay/files/deploy_log.txt"
             textSize = 13f
             setTextColor(HudUi.TEXT_MAIN)
             setLineSpacing(HudUi.dp(ctx, 3f), 1f)

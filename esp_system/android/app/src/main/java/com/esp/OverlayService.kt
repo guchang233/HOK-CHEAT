@@ -41,6 +41,13 @@ class OverlayService : Service() {
     private var toolbarView: View? = null
     private var toolbarParams: WindowManager.LayoutParams? = null
 
+    // 日志面板
+    private var logPanelView: View? = null
+    private var logPanelParams: WindowManager.LayoutParams? = null
+    private var logTextView: TextView? = null
+    private var logTabButtons: Array<TextView?> = arrayOfNulls(3)
+    private var logCurrentTab = 0
+
     // HUD 引用
     private var toolbarRoot: FrameLayout? = null
     private var panelScroll: ScrollView? = null
@@ -62,6 +69,10 @@ class OverlayService : Service() {
         const val ACTION_DEPLOY_READER = "com.esp.DEPLOY_READER"
         const val ACTION_STOP_READER = "com.esp.STOP_READER"
         const val ACTION_LOG_READER = "com.esp.LOG_READER"
+
+        const val LOG_TAB_DEPLOY = 0
+        const val LOG_TAB_READER = 1
+        const val LOG_TAB_DIAG = 2
 
         const val GAME_PKG_DEFAULT = "com.tencent.tmgp.sgame"
         const val READER_PORT_DEFAULT = 47291
@@ -168,10 +179,7 @@ class OverlayService : Service() {
                 RootHelper.stopReader()
                 readerStatus = "读取器已停止"
             }
-            ACTION_LOG_READER -> {
-                lastLog = RootHelper.getReaderLog(30)
-                readerStatus = "日志: ${lastLog.take(60)}"
-            }
+            ACTION_LOG_READER -> showLogPanel(LOG_TAB_DEPLOY)
         }
         return START_STICKY
     }
@@ -207,6 +215,7 @@ class OverlayService : Service() {
             } catch (_: Exception) {
             }
         }
+        hideLogPanel()
         espView = null
         toolbarView = null
         toolbarRoot = null
@@ -638,40 +647,269 @@ class OverlayService : Service() {
     // ==================== 读取器部署 ====================
     private fun deployAndStartReader() {
         readerStatus = "部署中..."
+        DeployLogger.init(this)
+        val t0 = SystemClock.elapsedRealtime()
+        DeployLogger.i("Deploy", "========== 部署开始 ==========")
         Thread {
             try {
+                // ---- 阶段 1: Root 授权 ----
+                DeployLogger.i("Deploy", "阶段1/3: 请求 Root 授权...")
                 if (!RootHelper.isRootAvailable()) {
-                    readerStatus = "错误: 未获得 Root 授权"
+                    DeployLogger.e("Deploy", "Root 不可用 — su 未安装 / 未授权 / 授权被拒绝")
+                    DeployLogger.e("Deploy", "对策: 确认设备已 Root, 且 Magisk/KernelSU 已对「ESP 透视」授予 Root 权限")
+                    readerStatus = "失败: 未获得 Root (点「日志」查看分析)"
                     return@Thread
                 }
 
+                // ---- 阶段 2: 部署二进制 (首选 ABI, 失败自动切换) ----
                 val primary = RootHelper.pickReaderAsset()
                 val fallback = if (primary == "tv_reader_x64") "tv_reader_arm64" else "tv_reader_x64"
+                DeployLogger.i("Deploy", "阶段2/3: 部署读取器 (首选 $primary / 备用 $fallback)")
                 var deployResult = RootHelper.extractAndDeployReader(this, primary)
                 if (!deployResult.success || !RootHelper.launchTest()) {
-                    Log.w(TAG, "主资产 $primary 失败, 改试 $fallback")
+                    DeployLogger.w("Deploy", "首选 $primary 不可用, 切换备用 $fallback 重试")
                     deployResult = RootHelper.extractAndDeployReader(this, fallback)
                 }
                 if (!deployResult.success) {
-                    readerStatus = "部署失败: ${deployResult.error}"
+                    DeployLogger.e("Deploy", "部署失败: ${deployResult.error}")
+                    readerStatus = "部署失败 (点「日志」查看诊断)"
+                    runDiagnosis()
                     return@Thread
                 }
 
-                val binInfo = RootHelper.verifyBinary()
-                Log.i(TAG, "二进制已部署: $binInfo")
-
+                // ---- 阶段 3: 启动 ----
+                DeployLogger.i("Deploy", "阶段3/3: 启动读取器 (包名 $GAME_PKG_DEFAULT, 端口 $READER_PORT_DEFAULT)")
                 val launchResult = RootHelper.launchReader(GAME_PKG_DEFAULT, READER_PORT_DEFAULT)
                 if (launchResult.success) {
                     readerStatus = "读取器运行中 ✓"
+                    DeployLogger.i("Deploy", "========== 部署成功, 总耗时 ${SystemClock.elapsedRealtime() - t0}ms ==========")
                 } else {
-                    readerStatus = "启动失败: ${launchResult.error}"
+                    DeployLogger.e("Deploy", "========== 启动失败 ==========")
+                    readerStatus = "启动失败 (点「日志」查看诊断)"
                     lastLog = RootHelper.getReaderLog(30)
+                    runDiagnosis()
                 }
             } catch (e: Exception) {
-                readerStatus = "错误: ${e.message}"
+                DeployLogger.e("Deploy", "部署异常: ${e.stackTraceToString()}")
+                readerStatus = "错误: ${e.message?.take(40)} (点「日志」)"
                 Log.e(TAG, "deploy failed", e)
             }
         }.start()
+    }
+
+    /** 失败后自动执行环境诊断并写入日志, 供「日志」面板查看。 */
+    private fun runDiagnosis() {
+        try {
+            val diag = RootHelper.diagnose(GAME_PKG_DEFAULT, READER_PORT_DEFAULT)
+            val hints = RootHelper.analyzeFailure(diag)
+            DeployLogger.e("分析", "失败原因分析:")
+            hints.forEachIndexed { i, h -> DeployLogger.e("分析", "${i + 1}. $h") }
+        } catch (e: Exception) {
+            DeployLogger.e("Diag", "诊断自身异常: ${e.message}")
+        }
+    }
+
+    // ==================== 日志面板 ====================
+    private fun showLogPanel(tab: Int) {
+        if (logPanelView != null) {
+            refreshLogPanel(tab)
+            return
+        }
+        DeployLogger.init(this)
+        val ctx = this
+        val dm = resources.displayMetrics
+        val panelW = HudUi.dp(ctx, 340f).toInt()
+        val panelH = HudUi.dp(ctx, 480f).toInt()
+        val pad = HudUi.dp(ctx, 10f).toInt()
+
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = HudUi.panelBg(ctx, 14f)
+            setPadding(pad, pad, pad, pad)
+        }
+
+        // ---- 头部: 标题 + 关闭 ----
+        val header = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(TextView(ctx).apply {
+            text = "诊断日志"
+            textSize = 13f
+            setTextColor(HudUi.ACCENT)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        header.addView(View(ctx), LinearLayout.LayoutParams(0, 1, 1f))
+        header.addView(HudUi.actionButton(ctx, "× 关闭") { hideLogPanel() })
+        root.addView(header)
+
+        root.addView(View(ctx).apply {
+            setBackgroundColor(HudUi.STROKE_DIM)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, HudUi.dp(ctx, 1f).toInt()
+            ).apply { topMargin = HudUi.dp(ctx, 6f).toInt() }
+        })
+
+        // ---- Tab 行 ----
+        fun tabButton(label: String, idx: Int): TextView =
+            HudUi.actionButton(ctx, label) { refreshLogPanel(idx) }
+
+        val tabRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, HudUi.dp(ctx, 6f).toInt(), 0, HudUi.dp(ctx, 2f).toInt())
+        }
+        logTabButtons = arrayOf<TextView?>(
+            tabButton("部署", LOG_TAB_DEPLOY),
+            tabButton("读取器", LOG_TAB_READER),
+            tabButton("诊断", LOG_TAB_DIAG),
+            HudUi.actionButton(ctx, "清除") {
+                DeployLogger.clear()
+                refreshLogPanel(logCurrentTab)
+            }
+        )
+        fun tabLp(last: Boolean) = LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, if (last) 0.6f else 1f
+        ).apply { marginEnd = HudUi.dp(ctx, 4f).toInt() }
+        logTabButtons.forEachIndexed { i, b ->
+            tabRow.addView(b, if (i == logTabButtons.size - 1) tabLp(true) else tabLp(false))
+        }
+        root.addView(tabRow)
+
+        // ---- 内容区 ----
+        val text = TextView(ctx).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 9.5f
+            setTextColor(HudUi.TEXT_MAIN)
+            setLineSpacing(HudUi.dp(ctx, 2f), 1f)
+            setPadding(0, HudUi.dp(ctx, 4f).toInt(), 0, 0)
+        }
+        val scroll = ScrollView(ctx).apply {
+            isVerticalScrollBarEnabled = true
+            addView(text, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        root.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+        ))
+        logTextView = text
+
+        // ---- 挂载 ----
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        val lp = WindowManager.LayoutParams(
+            panelW, panelH, type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = ((dm.widthPixels - panelW) / 2).coerceAtLeast(0)
+            y = ((dm.heightPixels - panelH) / 2).coerceAtLeast(0)
+        }
+        try {
+            windowManager.addView(root, lp)
+        } catch (e: Exception) {
+            Log.w(TAG, "日志面板挂载失败", e)
+            return
+        }
+        logPanelView = root
+        logPanelParams = lp
+
+        // 头部拖动移动
+        var downX = 0f; var downY = 0f; var lpX = 0; var lpY = 0
+        header.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = ev.rawX; downY = ev.rawY
+                    lpX = lp.x; lpY = lp.y
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    lp.x = (lpX + (ev.rawX - downX).toInt()).coerceIn(0, dm.widthPixels)
+                    lp.y = (lpY + (ev.rawY - downY).toInt()).coerceIn(0, dm.heightPixels)
+                    try { windowManager.updateViewLayout(root, lp) } catch (_: Exception) {}
+                    true
+                }
+                MotionEvent.ACTION_UP -> true
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
+
+        refreshLogPanel(tab)
+    }
+
+    private fun hideLogPanel() {
+        logPanelView?.let {
+            try { windowManager.removeView(it) } catch (_: Exception) {}
+        }
+        logPanelView = null
+        logPanelParams = null
+    }
+
+    /** 切换 tab 并刷新内容 (诊断 tab 为即时采集, 后台执行)。 */
+    private fun refreshLogPanel(tab: Int) {
+        logCurrentTab = tab
+        // tab 高亮: 当前 tab 用 ACCENT 描边样式 (重设 background)
+        logTabButtons.forEachIndexed { i, b ->
+            b ?: return@forEachIndexed
+            val active = i == tab
+            b.setTextColor(if (active) HudUi.ACCENT else HudUi.TEXT_DIM)
+        }
+        val tv = logTextView ?: return
+
+        when (tab) {
+            LOG_TAB_DEPLOY -> {
+                tv.text = DeployLogger.get().ifEmpty { "暂无部署日志 — 点工具栏「部署」开始" }
+                postScrollToBottom()
+            }
+            LOG_TAB_READER -> {
+                tv.text = "(现场采集 tv_reader 日志...)"
+                Thread {
+                    val log = RootHelper.getReaderLog(100)
+                    mainHandler?.post {
+                        logTextView?.text = log.ifEmpty { "tv_reader 暂无日志输出" }
+                        postScrollToBottom()
+                    }
+                }.start()
+            }
+            LOG_TAB_DIAG -> {
+                tv.text = "诊断中... (采集 ABI / Root / SELinux / 挂载 / 游戏 / 端口)\n"
+                Thread {
+                    val diag = RootHelper.diagnose(GAME_PKG_DEFAULT, READER_PORT_DEFAULT)
+                    val hints = RootHelper.analyzeFailure(diag)
+                    val sb = StringBuilder()
+                    sb.append("【失败原因分析】\n")
+                    hints.forEach { sb.append(" • $it\n") }
+                    sb.append("\n【原始诊断】\n")
+                    sb.append(diag)
+                    mainHandler?.post {
+                        logTextView?.text = sb.toString()
+                        postScrollToBottom()
+                    }
+                }.start()
+            }
+        }
+    }
+
+    private fun postScrollToBottom() {
+        logPanelView?.post {
+            // 内容区是 root 的最后一个子 View (ScrollView)
+            val root = logPanelView as? LinearLayout ?: return@post
+            for (i in root.childCount - 1 downTo 0) {
+                val c = root.getChildAt(i)
+                if (c is ScrollView) {
+                    c.post { c.fullScroll(View.FOCUS_DOWN) }
+                    break
+                }
+            }
+        }
     }
 
     // ==================== 前台服务 ====================

@@ -58,6 +58,7 @@ object RootHelper {
         if (shellReady && suProcess != null) return true
         killShell()
         return try {
+            DeployLogger.i("Root", "拉起 su shell (首次会弹授权框)...")
             val p = ProcessBuilder("su")
                 .redirectErrorStream(true)   // 合并 stderr, 防止缓冲区涨满死锁
                 .start()
@@ -70,9 +71,11 @@ object RootHelper {
             suStdin!!.flush()
             val first = suStdout!!.readLine()
             shellReady = first != null && first.contains("uid=0")
+            DeployLogger.i("Root", "su 响应: ${first ?: "(无输出)"} → ${if (shellReady) "授权成功" else "未授权"}")
             if (!shellReady) killShell()
             shellReady
         } catch (e: Exception) {
+            DeployLogger.e("Root", "su shell 启动失败: ${e.message} (su 可能不存在)")
             Log.w(TAG, "su shell 启动失败: ${e.message}")
             killShell()
             false
@@ -131,14 +134,23 @@ object RootHelper {
      */
     fun launchTest(): Boolean {
         val r = execute("$TARGET_BIN --help >/dev/null 2>&1; echo TEST_OK:\$?")
-        // 无 --help 时退出码非 0 也无妨, 只要能产出 TEST_OK 即代表 ELF 可执行
-        return r.output.contains("TEST_OK:")
+        val ok = r.output.contains("TEST_OK:")
+        // 注意: 输出含 "not executable"/"Exec format error" 时说明 ELF 架构不匹配
+        DeployLogger.i("Deploy", "ELF 可执行性测试 → ${if (ok) "通过" else "不可执行: ${r.output.take(120)}"}")
+        if (!ok && r.output.contains("Format error", true)) {
+            DeployLogger.w("Deploy", "Exec format error = ABI 不匹配 (如 ARM 设备上执行 x86 二进制)")
+        }
+        return ok
     }
 
     fun extractAndDeployReader(context: Context, assetName: String): RootResult {
+        val t0 = System.currentTimeMillis()
+        DeployLogger.i("Deploy", "--- 部署资产 $assetName ---")
+
         val mkdirResult = execute("mkdir -p $TARGET_DIR")
+        DeployLogger.i("Deploy", "mkdir -p $TARGET_DIR → ${mkdirResult.output.ifEmpty { "OK" }}")
         if (!mkdirResult.success) {
-            Log.e(TAG, "mkdir 失败: ${mkdirResult.error}")
+            DeployLogger.e("Deploy", "mkdir 失败: ${mkdirResult.error}")
             return mkdirResult
         }
 
@@ -149,51 +161,65 @@ object RootHelper {
                     input.copyTo(output)
                 }
             }
+            val size = tmpFile.length()
+            DeployLogger.i("Deploy", "资产解压到缓存: $size bytes")
 
             val copyResult = execute("cp ${tmpFile.absolutePath} $TARGET_BIN")
+            DeployLogger.i("Deploy", "cp → $TARGET_BIN ${if (copyResult.success) "OK" else "失败: ${copyResult.output}"}")
             if (!copyResult.success) {
-                Log.e(TAG, "cp 失败: ${copyResult.error}")
+                DeployLogger.e("Deploy", "cp 失败: ${copyResult.error} 输出: ${copyResult.output}")
                 return copyResult
             }
 
             execute("chmod 755 $TARGET_BIN")
             execute("chmod 755 $TARGET_DIR")
+            DeployLogger.i("Deploy", "chmod 755 完成")
 
             tmpFile.delete()
 
             val check = execute("ls -la $TARGET_BIN")
             if (check.output.contains(TARGET_BIN)) {
-                Log.i(TAG, "tv_reader 已部署: $assetName → $TARGET_BIN")
+                DeployLogger.i("Deploy", "部署完成 ($assetName), 耗时 ${System.currentTimeMillis() - t0}ms: ${check.output.trim()}")
                 return RootResult(true, check.output, "")
             }
 
-            Log.e(TAG, "部署后未找到二进制")
+            DeployLogger.e("Deploy", "部署后 ls 未找到二进制: ${check.output}")
             return RootResult(false, "", "部署后未找到二进制")
         } catch (e: Exception) {
+            DeployLogger.e("Deploy", "资产解压异常: ${e.message}")
             Log.e(TAG, "解压失败", e)
             return RootResult(false, "", e.message ?: "解压失败")
         }
     }
 
     fun launchReader(gamePkg: String, port: Int): RootResult {
+        DeployLogger.i("Launch", "清理旧进程...")
         execute("killall tv_reader 2>/dev/null || true")
         Thread.sleep(200)
 
         val cmd = "$TARGET_BIN --game-pkg $gamePkg --port $port"
+        DeployLogger.i("Launch", "启动: nohup $cmd > $LOG_FILE 2>&1 &")
         execute("nohup $cmd > $LOG_FILE 2>&1 &")
 
-        Thread.sleep(500)
-
-        val checkResult = execute("ps -A | grep tv_reader || echo NOT_RUNNING")
-        val running = checkResult.output.contains("tv_reader")
-
-        Log.i(TAG, "读取器启动: running=$running")
+        // 启动后多次探测, 给进程初始化留时间 (找不到游戏时 tv_reader 可能先跑几百 ms)
+        var running = false
+        var psOut = ""
+        for (i in 1..3) {
+            Thread.sleep(500)
+            val checkResult = execute("ps -A | grep tv_reader || echo NOT_RUNNING")
+            psOut = checkResult.output
+            running = psOut.contains("tv_reader")
+            if (running) break
+            DeployLogger.w("Launch", "第 $i 次探测未发现进程, 继续等待...")
+        }
 
         return if (running) {
+            DeployLogger.i("Launch", "读取器进程运行中: ${psOut.trim().take(120)}")
             RootResult(true, "读取器运行中", "")
         } else {
             val logResult = execute("tail -20 $LOG_FILE 2>/dev/null || echo no_log")
-            Log.w(TAG, "读取器未运行。日志: ${logResult.output}")
+            DeployLogger.e("Launch", "读取器未存活! 启动后日志尾部:")
+            DeployLogger.e("Launch", logResult.output.ifBlank { "(无输出 — 可能启动即闪退或 noexec 拒绝执行)" })
             RootResult(false, "", "未运行: ${logResult.output.take(200)}")
         }
     }
@@ -210,5 +236,76 @@ object RootHelper {
     fun verifyBinary(): String {
         val result = execute("ls -la $TARGET_BIN 2>/dev/null || echo 未部署")
         return result.output.take(120)
+    }
+
+    /**
+     * 环境诊断 — 收集部署失败分析所需的全部现场信息。
+     * 覆盖: 设备 ABI / Root / SELinux / 挂载 noexec / 游戏安装与进程 /
+     *       读取器进程 / 端口监听 / 磁盘空间。
+     */
+    fun diagnose(gamePkg: String, port: Int): String {
+        val sb = StringBuilder()
+        fun sec(title: String) = sb.append("\n===== $title =====\n")
+        fun run(label: String, cmd: String) {
+            val r = execute(cmd)
+            sb.append("[$label] $cmd\n  → ${r.output.ifEmpty { "(无输出)" }}\n")
+        }
+
+        DeployLogger.i("Diag", "开始环境诊断...")
+        sec("设备")
+        run("ABI", "getprop ro.product.cpu.abi; getprop ro.product.cpu.abilist")
+        run("Android", "getprop ro.build.version.release; getprop ro.build.version.sdk")
+        run("机型", "getprop ro.product.model; getprop ro.product.manufacturer")
+        sec("Root")
+        run("su", "command -v su || which su")
+        run("uid", "id")
+        sec("SELinux")
+        run("模式", "getenforce")
+        sec("部署目标")
+        run("/data 挂载", "mount 2>/dev/null | grep ' /data ' | head -2")
+        run("目录", "ls -la $TARGET_DIR 2>/dev/null || echo 目录不存在")
+        run("二进制", "ls -la $TARGET_BIN 2>/dev/null || echo 未部署")
+        sec("游戏")
+        run("安装检测", "pm path $gamePkg 2>&1 | head -1")
+        run("游戏进程", "ps -A 2>/dev/null | grep $gamePkg | head -3 || echo 游戏未运行")
+        sec("读取器")
+        run("进程", "ps -A 2>/dev/null | grep tv_reader || echo 未运行")
+        run("端口 $port", "netstat -tlnp 2>/dev/null | grep :$port || echo 端口未监听")
+        run("日志尾部", "tail -30 $LOG_FILE 2>/dev/null || echo 无日志文件")
+        sec("存储")
+        run("空间", "df -h /data 2>/dev/null | tail -1")
+
+        val out = sb.toString()
+        DeployLogger.i("Diag", out)
+        return out
+    }
+
+    /**
+     * 基于诊断输出给出人类可读的失败原因分析。
+     */
+    fun analyzeFailure(diag: String): List<String> {
+        val hints = mutableListOf<String>()
+        if (diag.contains("未安装", true) || (diag.contains("pm path", true) &&
+                    diag.substringAfter("pm path", "").substringBefore("\n").contains("No package", true))
+        ) {
+            hints.add("游戏未安装或包名不匹配: 读取器启动后找不到目标进程会立即退出 → 先安装游戏 (com.tencent.tmgp.sgame) 再部署")
+        }
+        if (diag.contains("游戏未运行") && !diag.contains("tv_reader")) {
+            hints.add("游戏进程未运行: 部署成功但读取器可能因找不到游戏而退出 → 先进游戏再重新部署")
+        }
+        if (diag.contains("Enforcing")) {
+            hints.add("SELinux 处于 Enforcing: 部分系统会拒绝执行 /data/adb 下的二进制 → root 下执行 setenforce 0 后重试")
+        }
+        if (Regex("noexec").containsMatchIn(diag.substringAfter("/data 挂载", "").substringBefore("====="))) {
+            hints.add("/data 分区带 noexec 标志: 该分区下的二进制无法执行 → 需换无 noexec 的目录部署")
+        }
+        if (diag.contains("command -v su") && diag.substringAfter("command -v su", "").substringBefore("\n").contains("(无输出)")) {
+            hints.add("su 不存在: 设备未 Root 或 root 管理器异常")
+        }
+        if (diag.contains("Exec format error", true)) {
+            hints.add("ABI 不匹配: 二进制架构与设备 CPU 不符 → 检查是否在 ARM 设备上跑了 x86 模拟器资产 (或反之)")
+        }
+        if (hints.isEmpty()) hints.add("未识别到明确原因, 请结合上方原始诊断输出与 tv_reader 日志尾部判断")
+        return hints
     }
 }
