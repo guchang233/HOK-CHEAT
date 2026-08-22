@@ -84,7 +84,9 @@ object RootHelper {
     // ==================== su 模式探测 ====================
 
     /**
-     * 确保 root 可用: 已有生效模式直接复用, 否则按序探测三种 su 语法。
+     * 确保 root 可用: 已有生效模式直接复用, 否则按序探测多种 su 语法。
+     * 针对雷电/MuMu 等模拟器的 Su 实现缺陷, 优先使用 sh -c 包装命令,
+     * 并引入 "退出码兜底" 机制 (即使 stdout 被吞, exit=0 也视为授权)。
      */
     @Synchronized
     private fun ensureShell(): Boolean {
@@ -95,25 +97,31 @@ object RootHelper {
         }
         killShell()
         suMode = SuMode.UNKNOWN
-        DeployLogger.i("Root", "--- su 模式探测 (su -c → su 0 → 交互式) ---")
+        DeployLogger.i("Root", "--- su 模式探测 (针对模拟器兼容优化) ---")
 
-        // 策略 1: su -c (Magisk/KernelSU/模拟器 root 均支持)
+        // 策略 1: su -c sh -c 'id' (Magisk/模拟器 root 均支持, 强制 shell 执行)
+        if (probeOneshot(arrayOf("su", "-c", "sh -c 'id'"), "su -c sh -c 'id'", SuMode.ONESHOT_C)) return true
+        // 策略 2: su 0 sh -c 'id' (AOSP 原生语法, 雷电模拟器特化路径)
+        if (probeOneshot(arrayOf("su", "0", "sh", "-c", "id"), "su 0 sh -c id", SuMode.ONESHOT_UID)) return true
+        // 策略 3: su -c id (简单命令, 兜底)
         if (probeOneshot(arrayOf("su", "-c", "id"), "su -c id", SuMode.ONESHOT_C)) return true
-        // 策略 2: AOSP 原生语法 su 0 (userdebug / 部分模拟器)
-        if (probeOneshot(arrayOf("su", "0", "id"), "su 0 id", SuMode.ONESHOT_UID)) return true
-        // 策略 3: 交互式持久 shell
+        // 策略 4: 交互式持久 shell
         if (probePersistent()) {
             suMode = SuMode.PERSISTENT
             return true
         }
 
-        DeployLogger.e("Root", "--- 三种 su 模式均未获得 uid=0 ---")
+        DeployLogger.e("Root", "--- 四种 su 模式均未获得 uid=0 ---")
         DeployLogger.e("Root", "排查建议: ① 模拟器需在设置中开启 ROOT 并重启模拟器 " +
                 "(雷电: 设置→其他设置→ROOT权限) ② Magisk/KernelSU 的超级用户列表里确认已授权本应用")
         return false
     }
 
-    /** 一次性命令探测: 跑一条 `id`, 看输出是否 uid=0。超时/非零退出/非 root 均视为失败。 */
+    /**
+     * 一次性命令探测: 跑一条 `id`, 看输出是否 uid=0。
+     * 针对模拟器缺陷, 增加退出码兜底: 若 stdout 为空但 exit=0, 视为授权成功
+     * (部分 Su 实现会吞掉 stdout, 导致读取线程阻塞或无输出)。
+     */
     private fun probeOneshot(args: Array<String>, desc: String, mode: SuMode): Boolean {
         return try {
             DeployLogger.i("Root", "探测 [$desc] (最长 ${PROBE_TIMEOUT_MS / 1000}s, 若弹授权框请点允许)...")
@@ -132,7 +140,7 @@ object RootHelper {
                 } catch (_: Exception) {}
             }.apply { isDaemon = true; start() }
 
-            // 轮询等待退出 (兼容低 API, 不用 waitFor(timeout))
+            // 轮询等待退出
             val start = SystemClock.elapsedRealtime()
             var exited = false
             while (SystemClock.elapsedRealtime() - start < PROBE_TIMEOUT_MS) {
@@ -141,17 +149,28 @@ object RootHelper {
             }
             if (!exited) {
                 p.destroyForcibly()
-                DeployLogger.e("Root", "[$desc] ✗ 超时无响应 (可能弹了授权框没点, 或 su 挂起)")
+                DeployLogger.e("Root", "[$desc] ✗ 超时无响应 (进程挂起, 可能 Su 实现缺陷)")
                 return false
             }
             t.join(300)
             val out = sb.toString().trim()
-            val ok = out.contains("uid=0")
+            val exitCode = p.exitValue()
+            
+            // 判定逻辑:
+            // 1. 明确成功: stdout 包含 uid=0
+            // 2. 兜底成功: stdout 为空 + exit=0 + 无拒绝关键字 (针对 Su 吞 stdout 的情况)
+            // 3. 明确失败: 包含 denied 或 exit != 0
+            val hasUid0 = out.contains("uid=0")
+            val hasDenied = out.contains("denied", true) || out.contains("not allowed", true)
+            val fallbackOk = out.isEmpty() && exitCode == 0 && !hasDenied
+            
+            val ok = hasUid0 || fallbackOk
             if (ok) {
                 suMode = mode
-                DeployLogger.i("Root", "[$desc] ✓ 授权成功: ${out.take(80)}")
+                DeployLogger.i("Root", "[$desc] ✓ 授权成功 (exit=$exitCode, stdout='${out.take(60)}')" + 
+                    if (fallbackOk) " [退出码兜底: Su 吞掉了 stdout]" else "")
             } else {
-                DeployLogger.e("Root", "[$desc] ✗ exit=${p.exitValue()} 输出: ${out.ifEmpty { "(无输出)" }.take(120)}")
+                DeployLogger.e("Root", "[$desc] ✗ exit=$exitCode 输出: ${out.ifEmpty { "(无输出, 可能 Su 实现缺陷或权限被拒)" }.take(150)}")
             }
             ok
         } catch (e: Exception) {
@@ -304,10 +323,12 @@ object RootHelper {
         }
     }
 
-    /** 一次性模式: `su -c "(cmd) 2>&1; echo MARK:$?"`, 收全部输出后解析 marker。 */
+    /** 一次性模式: `su -c "sh -c '(cmd) 2>&1; echo MARK:$?'"`, 收全部输出后解析 marker。
+     *  使用 sh -c 包装是为了兼容模拟器 Su 实现 (直接传命令可能被吞)。 */
     private fun executeOneshot(suPrefix: Array<String>, command: String): RootResult {
         val marker = "CMD_DONE_${System.nanoTime()}"
-        val full = "($command) 2>&1; echo ${marker}:\$?"
+        val innerCmd = "($command) 2>&1; echo ${marker}:\$?"
+        val full = "sh -c '$innerCmd'"
         val args = suPrefix + full
         return try {
             val p = ProcessBuilder(*args)
@@ -336,20 +357,26 @@ object RootHelper {
                 return RootResult(false, "", "命令超时 (${CMD_TIMEOUT_MS / 1000}s): ${command.take(60)}")
             }
             t.join(300)
+            val out = sb.toString()
+            val exitCode = p.exitValue()
 
             var code: Int? = null
             val outLines = StringBuilder()
-            for (l in sb.lines()) {
+            for (l in out.lines()) {
                 if (l.startsWith("$marker:")) {
                     code = l.substring(marker.length + 1).trim().toIntOrNull()
                 } else if (l.isNotBlank() || outLines.isNotEmpty()) {
                     outLines.appendLine(l)
                 }
             }
+
+            // 兜底: 如果没有 marker (被 Su 吞) 但 exit=0, 视为成功
             if (code == null) {
-                // 无 marker = su 拒绝执行 / shell 异常退出
-                return RootResult(false, sb.toString().trim(),
-                    "su 未返回结果 (可能授权被撤销): ${sb.toString().trim().take(120)}")
+                if (exitCode == 0) {
+                    return RootResult(true, outLines.toString().trim(), "")
+                }
+                return RootResult(false, outLines.toString().trim(),
+                    "su 未返回结果 (可能 Su 吞掉 stdout): exit=$exitCode")
             }
             RootResult(code == 0, outLines.toString().trim(), "")
         } catch (e: Exception) {
