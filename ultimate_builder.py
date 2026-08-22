@@ -462,6 +462,41 @@ def embed_esp_into_apk(
     return final
 
 
+def build_probe_apks(game_apk: Path, dex: Path, tv_bins: dict,
+                     out_dir: Path, keys_dir: Path) -> list:
+    """TP 反作弊检测点探针变体 (定位被检测的注入项):
+      game_test_dexonly.apk    — 仅追加 classesN.dex (不动 manifest/assets, ESP 不运行)
+      game_test_assetsonly.apk — 仅追加 assets tv_reader (不动 manifest/dex)
+    判定: 能进游戏 = 该项不被检测; 启动即被杀(SIGKILL) = TP 检测该项。"""
+    section("Step 5e  TP 检测探针变体 (dex-only / assets-only)")
+    arm64 = tv_bins.get("arm64_v8a")
+    specs = [
+        ("game_test_dexonly.apk", dict(inject_manifest=False, include_dex=True,
+                                       include_assets=False), False),
+        ("game_test_assetsonly.apk", dict(inject_manifest=False, include_dex=False,
+                                          include_assets=True), True),
+    ]
+    probes = []
+    for name, kw, with_assets in specs:
+        info(f"构建探针: {name} ...")
+        out_apk = out_dir / name.replace(".apk", "_unsigned.apk")
+        rep = apk_injector.inject_esp_into_apk(
+            game_apk, out_apk, dex,
+            tv_reader_arm64=arm64 if with_assets else None,
+            keys_dir=keys_dir, **kw)
+        if rep is None:
+            warn(f"探针 {name} 注入失败")
+            continue
+        if not apk_injector.verify_with_apksigner(out_apk):
+            warn(f"探针 {name} 签名校验失败")
+            continue
+        final = out_dir / name
+        shutil.move(str(out_apk), final)
+        ok(f"探针 → {final} ({final.stat().st_size:,} bytes)")
+        probes.append(final)
+    return probes
+
+
 def build_esp_overlay_apk(sdk: Path, tv_reader_bin: Path, out_dir: Path,
                            game_pkg: str, port: int) -> Path | None:
     """Build the ESP overlay APK with embedded tv_reader binary (分体模式, 可选)."""
@@ -536,6 +571,7 @@ def generate_deployment_bundle(
     out_dir: Path, game_pkg: str, server_addr: str | None, port: int,
     is_official: bool = False,
     embedded_apk: Path | None = None,
+    probe_apks: list = None,
 ):
     section("Step 6/6  生成部署包")
 
@@ -547,6 +583,10 @@ def generate_deployment_bundle(
     shutil.copy2(game_apk, deploy_dir / out_game_name)
     if esp_apk:
         shutil.copy2(esp_apk, deploy_dir / "esp_overlay.apk")
+
+    # ---- TP 检测探针 (定位反作弊检测项, 手动安装测试) ----
+    for probe in (probe_apks or []):
+        shutil.copy2(probe, deploy_dir / probe.name)
 
     server_display = server_addr if server_addr else "直连官方"
 
@@ -672,6 +712,14 @@ ESP 使用 (内置版):
   - 确保游戏已登录进入大厅后 ESP 才会有数据
   - 若 ESP 无显示，检查 tv_reader 日志:
     adb shell "su -c 'tail -50 /data/adb/esp/tv_reader.log'"
+
+TP 反作弊检测探针 (游戏内置版被杀时用于定位检测项):
+  game_test_dexonly.apk    — 仅多一个 classesN.dex, 不改 manifest/assets
+  game_test_assetsonly.apk — 仅多 assets/tv_reader, 不改 manifest/dex
+  逐个安装并启动游戏:
+    能进游戏  → 该项不被 TP 检测
+    启动几秒后被杀/白屏 → TP 检测该项
+  两个都能进游戏 → 检测点在 manifest 组件 (provider/service)
 ''', encoding='utf-8')
 
     ok(f"部署包 → {deploy_dir}/")
@@ -785,6 +833,7 @@ def main():
     # ---- Step 5: ESP 构建与内置注入 ----
     esp_apk_path = None
     embedded_apk = None
+    probe_apks = []
     tv_bins = {}
 
     if not args.skip_esp:
@@ -819,6 +868,9 @@ def main():
                     )
                     if embedded_apk is None:
                         warn("ESP 内置注入失败，仅保留分体模式产物")
+                    else:
+                        probe_apks = build_probe_apks(
+                            signed_apk, inject_dex, tv_bins, out_dir, keys_dir)
             else:
                 section("Step 5b-5c  跳过 ESP 内置注入 (--skip-embed)")
 
@@ -842,6 +894,7 @@ def main():
         signed_apk, esp_apk_path, tv_bins.get("arm64_v8a"),
         out_dir, args.game_pkg, server_addr, args.port, use_official,
         embedded_apk=embedded_apk,
+        probe_apks=probe_apks,
     )
     
     # ---- 最终总结 ----

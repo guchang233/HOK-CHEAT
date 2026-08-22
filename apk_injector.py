@@ -64,54 +64,65 @@ def inject_esp_into_apk(
     service_class: str = SERVICE_CLASS,
     extra_permissions=None,
     sign: bool = True,
+    inject_manifest: bool = True,
+    include_dex: bool = True,
+    include_assets: bool = True,
 ) -> dict:
-    """完整注入管线。返回报告 dict。"""
+    """完整注入管线。返回报告 dict。
+
+    inject_manifest / include_dex / include_assets 用于构建 TP 检测探针变体:
+    关闭后对应内容不注入 (纯文件级探针, ESP 代码不会运行)。"""
     report = {"base": str(base_apk), "out": str(out_apk)}
 
     # ---- 1. 读取并注入 manifest ----
-    with zipfile.ZipFile(base_apk) as zf:
-        manifest = zf.read("AndroidManifest.xml")
+    overrides = {}
+    if inject_manifest:
+        with zipfile.ZipFile(base_apk) as zf:
+            manifest = zf.read("AndroidManifest.xml")
 
-    # authorities 必须全局唯一: 用包名前缀
-    doc = AxmlDocument.parse(manifest)
-    pkg = doc.find_attr_str(doc.root, "package") or "unknown.pkg"
-    authorities = f"{pkg}.esp.inject"
+        # authorities 必须全局唯一: 用包名前缀
+        doc = AxmlDocument.parse(manifest)
+        pkg = doc.find_attr_str(doc.root, "package") or "unknown.pkg"
+        authorities = f"{pkg}.esp.inject"
 
-    new_manifest, mrep = inject_esp_into_manifest(
-        manifest,
-        provider_class=provider_class,
-        authorities=authorities,
-        service_class=service_class,
-        extra_permissions=extra_permissions,
-    )
-    report["manifest"] = mrep
-    report["manifest"]["authorities"] = authorities
-    hokstrap.LOG(f"  [manifest] package={pkg}")
-    hokstrap.LOG(f"  [manifest] +permissions={len(mrep['permissions'])} "
-                 f"provider={mrep['provider']} service={mrep['service']}")
+        new_manifest, mrep = inject_esp_into_manifest(
+            manifest,
+            provider_class=provider_class,
+            authorities=authorities,
+            service_class=service_class,
+            extra_permissions=extra_permissions,
+        )
+        report["manifest"] = mrep
+        report["manifest"]["authorities"] = authorities
+        hokstrap.LOG(f"  [manifest] package={pkg}")
+        hokstrap.LOG(f"  [manifest] +permissions={len(mrep['permissions'])} "
+                     f"provider={mrep['provider']} service={mrep['service']}")
 
-    # 往返校验: 注入结果必须能被重新解析
-    doc2 = AxmlDocument.parse(new_manifest)
-    assert doc2.find_child(doc2.root, "application") is not None, "manifest 往返校验失败"
+        # 往返校验: 注入结果必须能被重新解析
+        doc2 = AxmlDocument.parse(new_manifest)
+        assert doc2.find_child(doc2.root, "application") is not None, "manifest 往返校验失败"
+
+        overrides["AndroidManifest.xml"] = new_manifest
 
     # ---- 2. 计算新 dex 名称 ----
-    dex_name = next_dex_name(base_apk)
+    dex_name = next_dex_name(base_apk) if include_dex else None
     report["dex_entry"] = dex_name
-    hokstrap.LOG(f"  [dex] 注入条目: {dex_name} ({Path(dex_path).stat().st_size:,} bytes)")
+    if include_dex:
+        hokstrap.LOG(f"  [dex] 注入条目: {dex_name} ({Path(dex_path).stat().st_size:,} bytes)")
 
     # ---- 3. 新增 assets 条目 ----
     added = {}
-    if tv_reader_arm64 and Path(tv_reader_arm64).exists():
-        added[ASSET_ARM64] = Path(tv_reader_arm64).read_bytes()
-        hokstrap.LOG(f"  [assets] +{ASSET_ARM64} ({len(added[ASSET_ARM64]):,} bytes)")
-    if tv_reader_v7a and Path(tv_reader_v7a).exists():
-        added[ASSET_V7A] = Path(tv_reader_v7a).read_bytes()
-        hokstrap.LOG(f"  [assets] +{ASSET_V7A} ({len(added[ASSET_V7A]):,} bytes)")
-    report["added_entries"] = list(added.keys()) + [dex_name]
+    if include_assets:
+        if tv_reader_arm64 and Path(tv_reader_arm64).exists():
+            added[ASSET_ARM64] = Path(tv_reader_arm64).read_bytes()
+            hokstrap.LOG(f"  [assets] +{ASSET_ARM64} ({len(added[ASSET_ARM64]):,} bytes)")
+        if tv_reader_v7a and Path(tv_reader_v7a).exists():
+            added[ASSET_V7A] = Path(tv_reader_v7a).read_bytes()
+            hokstrap.LOG(f"  [assets] +{ASSET_V7A} ({len(added[ASSET_V7A]):,} bytes)")
+    report["added_entries"] = list(added.keys()) + ([dex_name] if dex_name else [])
 
     # ---- 4. ZIP 级重打包 (raw copy: 未修改条目原样保留压缩字节) ----
     out_apk.parent.mkdir(parents=True, exist_ok=True)
-    overrides = {"AndroidManifest.xml": new_manifest}
     entries = hokstrap.read_cd_entries(base_apk)
     stripped = [e['name'] for e in entries if hokstrap.OLD_SIG_RE.match(e['name'])]
     with open(base_apk, 'rb') as fin, open(out_apk, 'wb') as fh:
@@ -140,8 +151,9 @@ def inject_esp_into_apk(
                           e['time'], e['date'], e['flag'], align)
         # ---- 新增条目 ----
         now_t, now_d = hokstrap.dos_datetime((2026, 1, 1, 0, 0, 0))
-        dex_data = Path(dex_path).read_bytes()
-        w.add(dex_name, dex_data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
+        if include_dex:
+            dex_data = Path(dex_path).read_bytes()
+            w.add(dex_name, dex_data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
         for name, data in added.items():
             w.add(name, data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
         w.finish()

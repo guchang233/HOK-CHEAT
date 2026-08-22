@@ -141,6 +141,8 @@ jobs:
             output/deploy/game_embedded.apk
             output/deploy/game_official.apk
             output/deploy/game_private.apk
+            output/deploy/game_test_dexonly.apk
+            output/deploy/game_test_assetsonly.apk
             output/deploy/install.sh
             output/deploy/README.txt
           if-no-files-found: warn
