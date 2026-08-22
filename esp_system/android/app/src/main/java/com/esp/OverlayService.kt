@@ -58,7 +58,7 @@ class OverlayService : Service() {
         @Volatile var showFacing = true
         @Volatile var showNameLevel = true
         @Volatile var lastLog = ""
-        @Volatile var readerStatus = "idle"
+        @Volatile var readerStatus = "未部署"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -177,22 +177,22 @@ class OverlayService : Service() {
             }
             ACTION_STOP_READER -> {
                 RootHelper.stopReader()
-                readerStatus = "stopped"
+                readerStatus = "读取器已停止"
             }
             ACTION_LOG_READER -> {
                 lastLog = RootHelper.getReaderLog(30)
-                readerStatus = "log: ${lastLog.take(60)}"
+                readerStatus = "日志: ${lastLog.take(60)}"
             }
         }
         return START_STICKY
     }
 
     private fun deployAndStartReader() {
-        readerStatus = "deploying..."
+        readerStatus = "部署中..."
         Thread {
             try {
                 if (!RootHelper.isRootAvailable()) {
-                    readerStatus = "ERROR: no root access"
+                    readerStatus = "错误: 未获得 Root 授权"
                     return@Thread
                 }
 
@@ -200,26 +200,26 @@ class OverlayService : Service() {
                 val fallback = if (primary == "tv_reader_x64") "tv_reader_arm64" else "tv_reader_x64"
                 var deployResult = RootHelper.extractAndDeployReader(this, primary)
                 if (!deployResult.success || !RootHelper.launchTest()) {
-                    Log.w(TAG, "primary asset $primary failed, trying $fallback")
+                    Log.w(TAG, "主资产 $primary 失败, 改试 $fallback")
                     deployResult = RootHelper.extractAndDeployReader(this, fallback)
                 }
                 if (!deployResult.success) {
-                    readerStatus = "DEPLOY FAIL: ${deployResult.error}"
+                    readerStatus = "部署失败: ${deployResult.error}"
                     return@Thread
                 }
 
                 val binInfo = RootHelper.verifyBinary()
-                Log.i(TAG, "Binary deployed: $binInfo")
+                Log.i(TAG, "二进制已部署: $binInfo")
 
                 val launchResult = RootHelper.launchReader(GAME_PKG_DEFAULT, READER_PORT_DEFAULT)
                 if (launchResult.success) {
-                    readerStatus = "reader running ✓"
+                    readerStatus = "读取器运行中 ✓"
                 } else {
-                    readerStatus = "LAUNCH FAIL: ${launchResult.error}"
+                    readerStatus = "启动失败: ${launchResult.error}"
                     lastLog = RootHelper.getReaderLog(30)
                 }
             } catch (e: Exception) {
-                readerStatus = "ERROR: ${e.message}"
+                readerStatus = "错误: ${e.message}"
                 Log.e(TAG, "deploy failed", e)
             }
         }.start()
@@ -244,7 +244,7 @@ class OverlayService : Service() {
         }
 
         val title = TextView(ctx).apply {
-            text = "🎮 ESP Pro v2"
+            text = "🎮 ESP 透视"
             setTextColor(Color.argb(220, 100, 220, 255))
             textSize = 14f
             setPadding(0, dp(2), 0, dp(4))
@@ -265,12 +265,12 @@ class OverlayService : Service() {
         }
         ll.addView(row1)
 
-        row1.addView(toolbarButton("Deploy") {
-            readerStatus = "deploying..."
+        row1.addView(toolbarButton("部署") {
+            readerStatus = "部署中..."
             statusText.text = readerStatus
             sendServiceAction(ACTION_DEPLOY_READER)
         })
-        row1.addView(toolbarButton("Stop Reader") {
+        row1.addView(toolbarButton("停止读取器") {
             sendServiceAction(ACTION_STOP_READER)
         })
 
@@ -280,11 +280,11 @@ class OverlayService : Service() {
         }
         ll.addView(row2)
 
-        row2.addView(toolbarButton("Log") {
+        row2.addView(toolbarButton("日志") {
             sendServiceAction(ACTION_LOG_READER)
             statusText.text = lastLog.take(60)
         })
-        row2.addView(toolbarButton("Recenter") {
+        row2.addView(toolbarButton("居中") {
             sendServiceAction(ACTION_CENTER)
         })
 
@@ -334,7 +334,7 @@ class OverlayService : Service() {
 
         addSectionLabel(ll, "──────────────")
 
-        val stopBtn = toolbarButton("⏹ 停止 ESP") {
+        val stopBtn = toolbarButton("⏹ 停止透视") {
             stopSelf()
         }
         ll.addView(stopBtn)
@@ -450,23 +450,23 @@ class OverlayService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
                 CHANNEL_ID,
-                "ESP Overlay",
+                "ESP 悬浮窗",
                 NotificationManager.IMPORTANCE_LOW
             )
             mgr.createNotificationChannel(ch)
         }
         val notif: Notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("ESP Reader")
-                .setContentText("ESP overlay running")
+                .setContentTitle("ESP 透视")
+                .setContentText("透视悬浮窗运行中")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("ESP Reader")
-                .setContentText("ESP overlay running")
+                .setContentTitle("ESP 透视")
+                .setContentText("透视悬浮窗运行中")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build()

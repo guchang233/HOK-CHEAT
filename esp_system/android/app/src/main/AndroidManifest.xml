@@ -8,11 +8,13 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 声明 superuser 权限, 消除 root 管理器的"开发人员警告" -->
+    <uses-permission android:name="android.permission.ACCESS_SUPERUSER" />
 
     <application
         android:allowBackup="false"
         android:icon="@android:drawable/ic_menu_view"
-        android:label="ESP Reader"
+        android:label="ESP 透视"
         android:theme="@style/Theme.AppCompat.NoActionBar">
 
         <activity

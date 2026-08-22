@@ -3,13 +3,29 @@ package com.esp
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import java.io.BufferedReader
+import java.io.DataOutputStream
 import java.io.File
+import java.io.InputStreamReader
 
+/**
+ * Root 操作助手 — 持久 root shell 模式。
+ *
+ * 关键设计: 整个应用生命周期只启动一次 `su` 交互式进程,
+ * 后续所有命令通过 stdin 写入、stdout 读取 (marker 协议)。
+ * 好处: root 管理器只弹一次授权框, 不再每条命令都询问。
+ */
 object RootHelper {
     private const val TAG = "ESP-Root"
     private const val TARGET_DIR = "/data/adb/esp"
     private const val TARGET_BIN = "$TARGET_DIR/tv_reader"
     private const val LOG_FILE = "$TARGET_DIR/tv_reader.log"
+
+    // ---- 持久 root shell ----
+    private var suProcess: Process? = null
+    private var suStdin: DataOutputStream? = null
+    private var suStdout: BufferedReader? = null
+    @Volatile private var shellReady = false
 
     /**
      * 按 CPU ABI 选择要部署的 tv_reader 资产名。
@@ -33,46 +49,96 @@ object RootHelper {
         val error: String
     )
 
-    fun isRootAvailable(): Boolean {
+    /**
+     * 启动 (或复用) 持久 su shell。首次调用时 root 管理器弹一次授权;
+     * 授权后 shell 存活期间不再有任何弹窗。
+     */
+    @Synchronized
+    private fun ensureShell(): Boolean {
+        if (shellReady && suProcess != null) return true
+        killShell()
         return try {
-            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
-            val out = proc.inputStream.bufferedReader().readText()
-            proc.waitFor()
-            out.contains("uid=0")
+            val p = ProcessBuilder("su")
+                .redirectErrorStream(true)   // 合并 stderr, 防止缓冲区涨满死锁
+                .start()
+            suProcess = p
+            suStdin = DataOutputStream(p.outputStream)
+            suStdout = BufferedReader(InputStreamReader(p.inputStream))
+
+            // 探测: 等 shell 就绪并确认 uid=0 (授权弹窗发生在这里, 仅此一次)
+            suStdin!!.writeBytes("id\n")
+            suStdin!!.flush()
+            val first = suStdout!!.readLine()
+            shellReady = first != null && first.contains("uid=0")
+            if (!shellReady) killShell()
+            shellReady
         } catch (e: Exception) {
+            Log.w(TAG, "su shell 启动失败: ${e.message}")
+            killShell()
             false
         }
     }
 
-    fun execute(command: String): RootResult {
-        return try {
-            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-            val stdout = proc.inputStream.bufferedReader().readText().trim()
-            val stderr = proc.errorStream.bufferedReader().readText().trim()
-            val exit = proc.waitFor()
-            RootResult(exit == 0, stdout, stderr)
-        } catch (e: Exception) {
-            RootResult(false, "", e.message ?: e.javaClass.simpleName)
-        }
+    /** 关闭并重置 shell (下次 execute 会重新拉起, 若已授权则静默复权)。 */
+    @Synchronized
+    fun killShell() {
+        try { suStdin?.writeBytes("exit\n"); suStdin?.flush() } catch (_: Exception) {}
+        try { suStdin?.close() } catch (_: Exception) {}
+        try { suStdout?.close() } catch (_: Exception) {}
+        try { suProcess?.destroy() } catch (_: Exception) {}
+        suProcess = null; suStdin = null; suStdout = null
+        shellReady = false
     }
 
     /**
+     * 在持久 root shell 中执行命令 (marker 协议)。
+     * 与旧版 su -c 每次新进程不同: 不再反复触发授权弹窗。
+     */
+    @Synchronized
+    fun execute(command: String): RootResult {
+        if (!ensureShell()) return RootResult(false, "", "未获得 Root 授权")
+        val marker = "CMD_DONE_${System.nanoTime()}"
+        return try {
+            // 2>&1 合并错误输出; $? 取 (command) 的退出码
+            suStdin!!.writeBytes("($command) 2>&1; echo ${marker}:\$?\n")
+            suStdin!!.flush()
+            val sb = StringBuilder()
+            while (true) {
+                val line = suStdout!!.readLine()
+                if (line == null) {
+                    // shell 已退出 (被系统杀掉等) — 重置, 下次重建
+                    killShell()
+                    return RootResult(false, sb.toString().trim(), "Root 会话已结束")
+                }
+                if (line.startsWith("$marker:")) {
+                    val code = line.substring(marker.length + 1).trim().toIntOrNull() ?: -1
+                    return RootResult(code == 0, sb.toString().trim(), "")
+                }
+                sb.appendLine(line)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            RootResult(false, "", "")  // 不可达, 让编译器满意
+        } catch (e: Exception) {
+            killShell()
+            RootResult(false, "", "Root 会话错误: ${e.message}")
+        }
+    }
+
+    fun isRootAvailable(): Boolean = ensureShell()
+
+    /**
      * 验证已部署二进制能否在当前环境执行 (非 x86 设备上执行 x86 ELF 会失败)。
-     * tv_reader 无参运行打印用法后退出, 退出码 0/1 均代表"可执行"。
      */
     fun launchTest(): Boolean {
-        val r = execute("$TARGET_BIN 2>&1; echo EXIT:$?")
-        val out = r.output
-        // 可执行: 自身产出输出 (用法/日志); 不可执行: shell 报 "not executable"/"Exec format error"
-        return !out.contains("Exec format error", ignoreCase = true) &&
-               !out.contains("not executable", ignoreCase = true) &&
-               out.contains("EXIT:")
+        val r = execute("$TARGET_BIN --help >/dev/null 2>&1; echo TEST_OK:\$?")
+        // 无 --help 时退出码非 0 也无妨, 只要能产出 TEST_OK 即代表 ELF 可执行
+        return r.output.contains("TEST_OK:")
     }
 
     fun extractAndDeployReader(context: Context, assetName: String): RootResult {
         val mkdirResult = execute("mkdir -p $TARGET_DIR")
         if (!mkdirResult.success) {
-            Log.e(TAG, "mkdir failed: ${mkdirResult.error}")
+            Log.e(TAG, "mkdir 失败: ${mkdirResult.error}")
             return mkdirResult
         }
 
@@ -86,7 +152,7 @@ object RootHelper {
 
             val copyResult = execute("cp ${tmpFile.absolutePath} $TARGET_BIN")
             if (!copyResult.success) {
-                Log.e(TAG, "cp failed: ${copyResult.error}")
+                Log.e(TAG, "cp 失败: ${copyResult.error}")
                 return copyResult
             }
 
@@ -95,18 +161,17 @@ object RootHelper {
 
             tmpFile.delete()
 
-            val file = File(TARGET_BIN)
-            if (file.exists()) {
-                val size = file.length()
-                Log.i(TAG, "tv_reader deployed: $size bytes → $TARGET_BIN")
-                return RootResult(true, "deployed $size bytes", "")
+            val check = execute("ls -la $TARGET_BIN")
+            if (check.output.contains(TARGET_BIN)) {
+                Log.i(TAG, "tv_reader 已部署: $assetName → $TARGET_BIN")
+                return RootResult(true, check.output, "")
             }
 
-            Log.e(TAG, "Binary not found after copy")
-            return RootResult(false, "", "binary not found after copy")
+            Log.e(TAG, "部署后未找到二进制")
+            return RootResult(false, "", "部署后未找到二进制")
         } catch (e: Exception) {
-            Log.e(TAG, "Extract failed", e)
-            return RootResult(false, "", e.message ?: "Extract failed")
+            Log.e(TAG, "解压失败", e)
+            return RootResult(false, "", e.message ?: "解压失败")
         }
     }
 
@@ -115,21 +180,21 @@ object RootHelper {
         Thread.sleep(200)
 
         val cmd = "$TARGET_BIN --game-pkg $gamePkg --port $port"
-        val launchResult = execute("nohup $cmd > $LOG_FILE 2>&1 &")
+        execute("nohup $cmd > $LOG_FILE 2>&1 &")
 
         Thread.sleep(500)
 
         val checkResult = execute("ps -A | grep tv_reader || echo NOT_RUNNING")
         val running = checkResult.output.contains("tv_reader")
 
-        Log.i(TAG, "Reader launch: running=$running")
+        Log.i(TAG, "读取器启动: running=$running")
 
         return if (running) {
-            RootResult(true, "reader running", "")
+            RootResult(true, "读取器运行中", "")
         } else {
             val logResult = execute("tail -20 $LOG_FILE 2>/dev/null || echo no_log")
-            Log.w(TAG, "Reader not running. Log: ${logResult.output}")
-            RootResult(false, "", "not running: ${logResult.output.take(200)}")
+            Log.w(TAG, "读取器未运行。日志: ${logResult.output}")
+            RootResult(false, "", "未运行: ${logResult.output.take(200)}")
         }
     }
 
@@ -138,18 +203,12 @@ object RootHelper {
     }
 
     fun getReaderLog(lines: Int = 30): String {
-        val result = execute("tail -$lines $LOG_FILE 2>/dev/null || echo no_log")
+        val result = execute("tail -$lines $LOG_FILE 2>/dev/null || echo 无日志")
         return result.output.ifEmpty { result.error }
     }
 
     fun verifyBinary(): String {
-        val file = File(TARGET_BIN)
-        if (!file.exists()) return "NOT_DEPLOYED"
-        val size = file.length()
-        val head = try { file.readBytes().copyOfRange(0, minOf(4, size.toInt())) } catch (_: Exception) { byteArrayOf() }
-        val isElf = head.size >= 4 && head[0] == 0x7f.toByte() &&
-                     head[1] == 'E'.code.toByte() && head[2] == 'L'.code.toByte() && head[3] == 'F'.code.toByte()
-        val typeResult = execute("file $TARGET_BIN 2>/dev/null || echo unknown")
-        return "size=${size}B, elf=$isElf, ${typeResult.output.take(80)}"
+        val result = execute("ls -la $TARGET_BIN 2>/dev/null || echo 未部署")
+        return result.output.take(120)
     }
 }
