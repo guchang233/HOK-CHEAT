@@ -163,17 +163,15 @@ def step3_patch_official(apk_path: Path, out_dir: Path, keys_dir: Path) -> Path:
     patched = out_dir / "game_patched.apk"
     signed  = out_dir / "game_signed.apk"
 
-    info("剥离旧签名条目，重新打包 (对齐 4/4096)...")
+    info("剥离旧签名条目，重新打包 (原样拷贝 + 对齐 4/4096)...")
     hokstrap.rebuild_apk(str(apk_path), str(patched), {})
     ok(f"重打包完成 → {patched} ({os.path.getsize(patched):,} bytes)")
 
-    info("v2 签名...")
-    class Args: pass
-    a2 = Args()
-    a2.apk = str(patched)
-    a2.out = str(signed)
-    a2.keys_dir = str(keys_dir)
-    hokstrap.cmd_sign(a2)
+    info("签名 (apksigner v1+v2+v3)...")
+    shutil.copyfile(patched, signed)
+    if not apk_injector.sign_apk(Path(signed), Path(keys_dir)):
+        fail("签名失败")
+        sys.exit(1)
     ok(f"签名完成 → {signed} ({os.path.getsize(signed):,} bytes)")
 
     return signed
@@ -198,26 +196,44 @@ def step3_patch_and_sign(apk_path: Path, rules_path: Path, out_dir: Path, keys_d
     ok(f"替换完成 → {patched} ({os.path.getsize(patched):,} bytes)")
     
     # Sign
-    info("v2 签名...")
-    a2 = Args()
-    a2.apk = str(patched)
-    a2.out = str(signed)
-    a2.keys_dir = str(keys_dir)
-    hokstrap.cmd_sign(a2)
+    info("签名 (apksigner v1+v2+v3)...")
+    shutil.copyfile(patched, signed)
+    if not apk_injector.sign_apk(Path(signed), Path(keys_dir)):
+        fail("签名失败")
+        sys.exit(1)
     ok(f"签名完成 → {signed} ({os.path.getsize(signed):,} bytes)")
-    
+
     return signed
 
 def step4_verify(apk_path: Path):
     section("Step 4/6  校验 APK 结构与签名")
-    class Args: pass
-    a = Args()
-    a.apk = str(apk_path)
-    ret = hokstrap.cmd_verify(a)
-    if ret == 0:
-        ok("APK 结构 + v2 签名 校验通过")
+    # 1) 结构校验: zip 可读 / resources.arsc STORED / STORED 条目对齐
+    #    (v2 摘要已覆盖全文件字节, 官方 apksigner verify 负责完整性;
+    #     不再整包 inflate 校验 CRC, 2GB 级 APK 上又慢又吃内存)
+    ok_all = True
+    try:
+        with zipfile.ZipFile(apk_path) as zf:
+            names = zf.namelist()
+            for n in hokstrap.FORCE_STORED:
+                if n in names and zf.getinfo(n).compress_type != zipfile.ZIP_STORED:
+                    fail(f"{n} 被压缩（API 30+ 要求 STORED）")
+                    ok_all = False
+    except Exception as e:
+        fail(f"zip 无法打开: {e}")
+        sys.exit(1)
+    checked, problems = hokstrap.check_alignment(str(apk_path))
+    if problems:
+        for p in problems:
+            fail(p)
+        ok_all = False
     else:
-        fail("校验失败，请检查 APK 有效性")
+        info(f"对齐检查: {checked} 个 STORED 条目通过 (.so=4096, 其余=4)")
+    # 2) 官方签名校验 (v1+v2+v3)
+    if not apk_injector.verify_with_apksigner(apk_path):
+        fail("apksigner 签名校验失败")
+        sys.exit(1)
+    ok("APK 结构 + apksigner 签名校验通过")
+    if not ok_all:
         sys.exit(1)
 
 # ================================================================

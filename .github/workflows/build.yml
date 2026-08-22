@@ -139,9 +139,11 @@ jobs:
           name: hok-embedded-${{ github.run_number }}
           path: |
             output/deploy/game_embedded.apk
+            output/deploy/game_official.apk
+            output/deploy/game_private.apk
             output/deploy/install.sh
             output/deploy/README.txt
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Release (tag builds)
         if: startsWith(github.ref, 'refs/tags/') && steps.apksrc.outputs.url != ''

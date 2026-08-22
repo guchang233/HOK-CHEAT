@@ -109,39 +109,42 @@ def inject_esp_into_apk(
         hokstrap.LOG(f"  [assets] +{ASSET_V7A} ({len(added[ASSET_V7A]):,} bytes)")
     report["added_entries"] = list(added.keys()) + [dex_name]
 
-    # ---- 4. ZIP 级重打包 ----
+    # ---- 4. ZIP 级重打包 (raw copy: 未修改条目原样保留压缩字节) ----
     out_apk.parent.mkdir(parents=True, exist_ok=True)
     overrides = {"AndroidManifest.xml": new_manifest}
-    with zipfile.ZipFile(base_apk) as zin:
-        infos = zin.infolist()
-        stripped = [i.filename for i in infos if hokstrap.OLD_SIG_RE.match(i.filename)]
-        with open(out_apk, 'wb') as fh:
-            w = hokstrap.AlignedZipWriter(fh)
-            for item in infos:
-                if hokstrap.OLD_SIG_RE.match(item.filename):
-                    continue
-                data = overrides.get(item.filename)
-                if data is None:
-                    data = zin.read(item.filename)
-                method = (zipfile.ZIP_STORED
-                          if item.filename in hokstrap.FORCE_STORED
-                          else item.compress_type)
-                is_so = item.filename.startswith('lib/') and item.filename.endswith('.so')
-                if method == zipfile.ZIP_DEFLATED:
-                    align = 1
-                elif is_so:
-                    align = hokstrap.ALIGN_PAGE
-                else:
-                    align = hokstrap.ALIGN_DEFAULT
-                t, d = hokstrap.dos_datetime(item.date_time)
-                w.add(item.filename, data, method, t, d, align)
-            # ---- 新增条目 ----
-            now_t, now_d = hokstrap.dos_datetime((2026, 1, 1, 0, 0, 0))
-            dex_data = Path(dex_path).read_bytes()
-            w.add(dex_name, dex_data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
-            for name, data in added.items():
-                w.add(name, data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
-            w.finish()
+    entries = hokstrap.read_cd_entries(base_apk)
+    stripped = [e['name'] for e in entries if hokstrap.OLD_SIG_RE.match(e['name'])]
+    with open(base_apk, 'rb') as fin, open(out_apk, 'wb') as fh:
+        w = hokstrap.AlignedZipWriter(fh)
+        for e in entries:
+            name = e['name']
+            if hokstrap.OLD_SIG_RE.match(name):
+                continue
+            method = (zipfile.ZIP_STORED
+                      if name in hokstrap.FORCE_STORED
+                      else e['method'])
+            is_so = name.startswith('lib/') and name.endswith('.so')
+            if method == zipfile.ZIP_DEFLATED:
+                align = 1
+            elif is_so:
+                align = hokstrap.ALIGN_PAGE
+            else:
+                align = hokstrap.ALIGN_DEFAULT
+            if name in overrides:
+                # 被替换条目 (manifest): 重新写出
+                w.add(name, overrides[name], method, e['time'], e['date'], align)
+            else:
+                # 原样拷贝: 保留源压缩字节与时间戳
+                raw = hokstrap.read_raw_entry(fin, e)
+                w.add_raw(name, raw, method, e['crc'], e['csize'], e['usize'],
+                          e['time'], e['date'], e['flag'], align)
+        # ---- 新增条目 ----
+        now_t, now_d = hokstrap.dos_datetime((2026, 1, 1, 0, 0, 0))
+        dex_data = Path(dex_path).read_bytes()
+        w.add(dex_name, dex_data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
+        for name, data in added.items():
+            w.add(name, data, zipfile.ZIP_DEFLATED, now_t, now_d, 1)
+        w.finish()
     if stripped:
         hokstrap.LOG(f"  [zip] 已剥离旧签名条目: {', '.join(stripped)}")
 
@@ -190,6 +193,10 @@ def sign_apk(apk: Path, keys_dir: Path, min_sdk: int = 24) -> bool:
     keys_dir.mkdir(parents=True, exist_ok=True)
     key_pem = keys_dir / "key.pem"
     cert_pem = keys_dir / "cert.pem"
+    # 密钥缺失时先生成（否则会错误地回退到无 v1 的自研签名，
+    # 导致部分模拟器安装器报"安装包解析失败"）
+    if not (key_pem.exists() and cert_pem.exists()):
+        hokstrap.get_or_create_key(str(keys_dir))
 
     apksigner = _find_tool("apksigner")
     if apksigner and key_pem.exists() and cert_pem.exists():
@@ -212,18 +219,22 @@ def sign_apk(apk: Path, keys_dir: Path, min_sdk: int = 24) -> bool:
              "--v3-signing-enabled", "true",
              "--out", str(apk) + ".signed",
              "--in", str(apk)],
-            capture_output=True, text=True, timeout=300)
+            capture_output=True, text=True, timeout=600)
         err = (r.stderr or "").split("WARNING")
         if r.returncode != 0:
             hokstrap.LOG(f"  [sign] apksigner 失败: {err[-1][:300]}")
             return False
         Path(str(apk) + ".signed").replace(apk)
+        # apksigner 附带的 v4 .idsig 侧车文件不需要, 清理
+        idsig = Path(str(apk) + ".signed.idsig")
+        if idsig.exists():
+            idsig.unlink()
         hokstrap.LOG(f"  [sign] apksigner v1+v2+v3 签名完成 → {apk}")
         return True
 
-    # 回退: hokstrap 自研 v2 (注意: 与 apksig 权威实现存在摘要算法偏差,
-    # 仅在无 apksigner 环境下使用)
-    hokstrap.LOG("  [sign] apksigner 不可用或密钥缺失, 回退 hokstrap v2")
+    # 回退: hokstrap 自研 v2 (摘要算法已与 apksig 权威实现对齐并通过交叉校验;
+    # 但仅 v2 无 v1 — Android 7.0 以下无法安装, 生产环境务必安装 build-tools)
+    hokstrap.LOG("  [sign] apksigner 不可用, 回退 hokstrap v2 (仅 Android 7+, 无 v1)")
     key, cert = hokstrap.get_or_create_key(str(keys_dir))
     blen = hokstrap.sign_v2_inplace(str(apk), key, cert)
     hokstrap.LOG(f"  [sign] v2 签名块 {blen} 字节 → {apk}")

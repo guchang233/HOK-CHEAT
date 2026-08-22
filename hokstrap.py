@@ -57,6 +57,23 @@ IP_RE = re.compile(rb'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b')
 LOG = lambda *a: print(*a, flush=True)
 
 
+def _find_apksigner():
+    """探测 build-tools 中的 apksigner（selftest 权威交叉校验用）。"""
+    import glob
+    import shutil as _sh
+    w = _sh.which('apksigner')
+    if w:
+        return w
+    for env in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'):
+        v = os.environ.get(env)
+        if v:
+            for p in sorted(glob.glob(f'{v}/build-tools/*/apksigner')):
+                return p
+    for p in sorted(glob.glob('/opt/android-tools/*/apksigner')):
+        return p
+    return None
+
+
 def u16(x): return struct.pack('<H', x)
 def u32(x): return struct.pack('<I', x)
 def u64(x): return struct.pack('<Q', x)
@@ -85,6 +102,7 @@ class AlignedZipWriter:
         self.entries = []
 
     def add(self, name, data, method, dos_time, dos_date, align=1):
+        """常规写入：重新压缩数据。"""
         name_b = name.encode('utf-8')
         crc = zlib.crc32(data) & 0xFFFFFFFF
         if method == zipfile.ZIP_DEFLATED:
@@ -93,7 +111,17 @@ class AlignedZipWriter:
         else:
             payload = data
         csize, usize = len(payload), len(data)
+        self._write_entry(name_b, payload, method, crc, csize, usize,
+                          dos_time, dos_date, 0x0800, align)
 
+    def add_raw(self, name, payload, method, crc, csize, usize,
+                dos_time, dos_date, flag=0x0800, align=1):
+        """原样写入：payload 为原始压缩字节（未解压重压），保持与源 APK 一致的数据布局。"""
+        self._write_entry(name.encode('utf-8'), payload, method, crc, csize, usize,
+                          dos_time, dos_date, flag, align)
+
+    def _write_entry(self, name_b, payload, method, crc, csize, usize,
+                     dos_time, dos_date, flag, align):
         header_pos = self.fh.tell()
         # 计算 extra 填充量，使数据区起始偏移满足对齐
         extra = b''
@@ -102,18 +130,23 @@ class AlignedZipWriter:
             pad = (-data_off) % align
             extra = b'\x00' * pad
 
-        self.fh.write(struct.pack(self.LFH_FMT, 0x04034B50, 20, 0x0800, method,
-                                  dos_time, dos_date, crc, csize, usize,
+        has_dd = bool(flag & 0x08)   # data descriptor: LFH 三字段须为 0
+        self.fh.write(struct.pack(self.LFH_FMT, 0x04034B50, 20, flag, method,
+                                  dos_time, dos_date,
+                                  0 if has_dd else crc,
+                                  0 if has_dd else csize,
+                                  0 if has_dd else usize,
                                   len(name_b), len(extra)))
         self.fh.write(name_b)
         self.fh.write(extra)
         self.fh.write(payload)
-        self.entries.append((name_b, method, dos_time, dos_date, crc, csize, usize, header_pos))
+        self.entries.append((name_b, method, dos_time, dos_date, crc, csize,
+                             usize, header_pos, flag))
 
     def finish(self):
         cd_off = self.fh.tell()
-        for (name_b, method, t, d, crc, csize, usize, hpos) in self.entries:
-            self.fh.write(struct.pack(self.CDH_FMT, 0x02014B50, (3 << 8) | 20, 20, 0x0800,
+        for (name_b, method, t, d, crc, csize, usize, hpos, flag) in self.entries:
+            self.fh.write(struct.pack(self.CDH_FMT, 0x02014B50, (3 << 8) | 20, 20, flag,
                                       method, t, d, crc, csize, usize,
                                       len(name_b), 0, 0, 0, 0, 0, hpos))
             self.fh.write(name_b)
@@ -148,23 +181,13 @@ def find_eocd(buf):
 
 
 def entry_data_offsets(path):
-    """解析中央目录，返回 {name: (method, header_off, data_off)}"""
+    """解析中央目录（流式，不整读文件），返回 {name: (method, header_off, data_off)}"""
     out = {}
     with open(path, 'rb') as f:
-        buf = f.read()
-    eocd_off, cd_off = find_eocd(buf)
-    pos, n = cd_off, r16(buf, eocd_off + 10)
-    for _ in range(n):
-        if r32(buf, pos) != 0x02014B50:
-            raise ValueError(f'中央目录头错误 @0x{pos:x}')
-        method = r16(buf, pos + 10)
-        fnlen, extralen = r16(buf, pos + 28), r16(buf, pos + 30)
-        cmlen = r16(buf, pos + 32)
-        hpos = r32(buf, pos + 42)
-        name = buf[pos + 46: pos + 46 + fnlen].decode('utf-8', 'replace')
-        lfn, lextra = r16(buf, hpos + 26), r16(buf, hpos + 28)
-        out[name] = (method, hpos, hpos + 30 + lfn + lextra)
-        pos += 46 + fnlen + extralen + cmlen
+        for e in read_cd_entries(path):
+            f.seek(e['hoff'] + 26)
+            lfn, lextra = struct.unpack('<HH', f.read(4))
+            out[e['name']] = (e['method'], e['hoff'], e['hoff'] + 30 + lfn + lextra)
     return out
 
 
@@ -334,31 +357,93 @@ def apply_replacements(args):
     return overrides
 
 
+def read_cd_entries(path):
+    """流式解析中央目录（不全量读入内存），按原顺序返回条目元数据。
+    返回 list of dict: name/flag/method/time/date/crc/csize/usize/hoff"""
+    with open(path, 'rb') as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        tail_len = min(fsize, 22 + 65535)
+        f.seek(fsize - tail_len)
+        tail = f.read(tail_len)
+        i = tail.rfind(b'PK\x05\x06')
+        if i < 0:
+            raise ValueError('找不到 EOCD（不是合法 zip?）')
+        eocd_off = fsize - tail_len + i
+        if eocd_off + 22 + r16(tail, i + 20) != fsize:
+            raise ValueError('EOCD 注释长度不匹配')
+        n, cd_size, cd_off = r16(tail, i + 10), r32(tail, i + 12), r32(tail, i + 16)
+        f.seek(cd_off)
+        cd = f.read(cd_size)
+
+    out, pos = [], 0
+    for _ in range(n):
+        if cd[pos:pos + 4] != b'PK\x01\x02':
+            raise ValueError(f'中央目录损坏 @0x{pos:x}')
+        flag = r16(cd, pos + 8)
+        method = r16(cd, pos + 10)
+        t, d = r16(cd, pos + 12), r16(cd, pos + 14)
+        crc = r32(cd, pos + 16)
+        csize, usize = r32(cd, pos + 20), r32(cd, pos + 24)
+        lfn = r16(cd, pos + 28)
+        extra = r16(cd, pos + 30)
+        comment = r16(cd, pos + 32)
+        hoff = r32(cd, pos + 42)
+        name = cd[pos + 46:pos + 46 + lfn].decode('utf-8', 'replace')
+        out.append(dict(name=name, flag=flag, method=method, time=t, date=d,
+                        crc=crc, csize=csize, usize=usize, hoff=hoff))
+        pos += 46 + lfn + extra + comment
+    return out
+
+
+def read_raw_entry(f, e):
+    """从源 zip 文件对象读取条目的原始压缩字节（含 data descriptor，若有）。"""
+    f.seek(e['hoff'])
+    lfh = f.read(30)
+    if lfh[:4] != b'PK\x03\x04':
+        raise ValueError(f"LFH 魔数错误: {e['name']}")
+    lfn_len, extra_len = r16(lfh, 26), r16(lfh, 28)
+    f.seek(e['hoff'] + 30 + lfn_len + extra_len)
+    raw = f.read(e['csize'])
+    if len(raw) != e['csize']:
+        raise ValueError(f"读取压缩数据不完整: {e['name']}")
+    if e['flag'] & 0x08:      # data descriptor (12B: crc+csize+usize, 非 zip64)
+        raw += f.read(12)
+    return raw
+
+
 def rebuild_apk(base_apk, out_apk, overrides):
-    """ZIP 级重建：保持条目顺序与压缩方式；剥离旧签名；
-    resources.arsc 强制 STORED；STORED 条目 4 字节对齐；STORED .so 页对齐。"""
-    with zipfile.ZipFile(base_apk) as zin:
-        infos = zin.infolist()
-        stripped = [i.filename for i in infos if OLD_SIG_RE.match(i.filename)]
-        with open(out_apk, 'wb') as fh:
-            w = AlignedZipWriter(fh)
-            for item in infos:
-                if OLD_SIG_RE.match(item.filename):
-                    continue
-                data = overrides.get(item.filename, None)
-                if data is None:
-                    data = zin.read(item.filename)
-                method = zipfile.ZIP_STORED if item.filename in FORCE_STORED else item.compress_type
-                is_so = item.filename.startswith('lib/') and item.filename.endswith('.so')
-                if method == zipfile.ZIP_DEFLATED:
-                    align = 1
-                elif is_so:
-                    align = ALIGN_PAGE
-                else:
-                    align = ALIGN_DEFAULT
-                t, d = dos_datetime(item.date_time)
-                w.add(item.filename, data, method, t, d, align)
-            cd_off, cd_size = w.finish()
+    """ZIP 级重建（原样拷贝模式）：未修改条目按原始压缩字节原样写出，
+    数据布局与源 APK 保持一致（对页缓存/mmap 友好）；仅被替换的条目重新压缩；
+    剥离旧签名；resources.arsc 强制 STORED；STORED 条目 4 字节对齐、.so 页对齐。"""
+    entries = read_cd_entries(base_apk)
+    stripped = [e['name'] for e in entries if OLD_SIG_RE.match(e['name'])]
+    with open(base_apk, 'rb') as fin, open(out_apk, 'wb') as fh:
+        w = AlignedZipWriter(fh)
+        for e in entries:
+            name = e['name']
+            if OLD_SIG_RE.match(name):
+                continue
+            is_so = name.startswith('lib/') and name.endswith('.so')
+            method = zipfile.ZIP_STORED if name in FORCE_STORED else e['method']
+            if method == zipfile.ZIP_DEFLATED:
+                align = 1
+            elif is_so:
+                align = ALIGN_PAGE
+            else:
+                align = ALIGN_DEFAULT
+
+            if name in overrides or (name in FORCE_STORED and e['method'] != zipfile.ZIP_STORED):
+                # 被替换的条目 / arsc 需由压缩转 STORED：解压后重新写出
+                with zipfile.ZipFile(base_apk) as zf:
+                    data = overrides.get(name) or zf.read(name)
+                w.add(name, data, method, e['time'], e['date'], align)
+            else:
+                # 原样拷贝：保留源压缩字节与时间戳
+                raw = read_raw_entry(fin, e)
+                w.add_raw(name, raw, method, e['crc'], e['csize'], e['usize'],
+                          e['time'], e['date'], e['flag'], align)
+        cd_off, cd_size = w.finish()
     if stripped:
         LOG(f'  已剥离旧签名条目: {", ".join(stripped)}')
     return cd_off, cd_size
@@ -376,6 +461,40 @@ def cmd_patch(args):
 # ============================================================
 # sign — APK Signature Scheme v2（RSA-2048 / SHA-256 / PKCS#1 v1.5）
 # ============================================================
+def _locate_zip(path):
+    """小 IO 定位 EOCD/CD（不整读文件，2GB 级 APK 安全）。返回 (eocd_off, cd_off, fsize)。"""
+    with open(path, 'rb') as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        tail_len = min(fsize, 22 + 65535)
+        f.seek(fsize - tail_len)
+        tail = f.read(tail_len)
+        i = tail.rfind(b'PK\x05\x06')
+        if i < 0:
+            raise ValueError('找不到 EOCD（不是合法 zip?）')
+        eocd_off = fsize - tail_len + i
+        if eocd_off + 22 + r16(tail, i + 20) != fsize:
+            raise ValueError('EOCD 注释长度不匹配')
+        return eocd_off, r32(tail, i + 16), fsize
+
+
+def _find_block_start(f, cd_off):
+    """若 CD 前存在 APK 签名块，返回块起始偏移；否则返回 cd_off。"""
+    if cd_off >= 24:
+        f.seek(cd_off - 16)
+        if f.read(16) == V2_BLOCK_MAGIC:
+            f.seek(cd_off - 24)
+            size2 = r64(f.read(8), 0)
+            block_start = cd_off - 8 - size2
+            if block_start < 0:
+                raise ValueError('签名块 size 非法')
+            f.seek(block_start)
+            if r64(f.read(8), 0) != size2:
+                raise ValueError('签名块 size 字段不一致')
+            return block_start
+    return cd_off
+
+
 def get_or_create_key(keys_dir):
     """首次生成本地密钥并持久化——保证多次构建签名身份一致，adb install -r 不冲突"""
     os.makedirs(keys_dir, exist_ok=True)
@@ -411,53 +530,57 @@ def get_or_create_key(keys_dir):
     return key, cert
 
 
-def chunked_digest(data):
-    """v2 chunked SHA-256: SHA256(0xA7 ‖ Σ( u32(len(chunk)) ‖ SHA256(u32(len)+chunk) ))"""
+def chunked_digest(sections):
+    """APK Signature Scheme v2 CHUNKED_SHA256 内容摘要（与 apksig 权威实现一致）。
+    sections: 依序各段字节（ZIP条目区 / 中央目录 / EOCD）。
+    每段独立按 1MB 分块；块摘要 = SHA256(0xa5 ‖ u32(块长) ‖ 块)；
+    顶级摘要 = SHA256(0x5a ‖ u32(总块数) ‖ Σ块摘要) —— 单个 32 字节值。"""
+    digests = []
+    for sec in sections:
+        chunks = ([sec[i:i + CHUNK_SIZE] for i in range(0, len(sec), CHUNK_SIZE)]
+                  or [b''])
+        for c in chunks:
+            digests.append(hashlib.sha256(b'\xa5' + u32(len(c)) + c).digest())
     h = hashlib.sha256()
-    h.update(b'\xa7')
-    if not data:
-        chunks = [b'']
-    else:
-        chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
-    for chunk in chunks:
-        h.update(u32(len(chunk)))
-        d = hashlib.sha256(u32(len(chunk)) + chunk).digest()
-        h.update(u32(len(d)) + d)
+    h.update(b'\x5a')
+    h.update(u32(len(digests)))
+    for d in digests:
+        h.update(d)
     return h.digest()
 
 
-def strip_existing_v2(buf):
-    """若已含 v2 签名块则剥离（支持对已签名文件重签）"""
-    eocd_off, cd_off = find_eocd(buf)
-    if cd_off >= 24 and buf[cd_off - 16:cd_off] == V2_BLOCK_MAGIC:
-        size2 = r64(buf, cd_off - 24)
-        block_start = cd_off - 8 - size2  # size2 计入 pairs+尾size+magic，不含首 size 字段
-        if block_start < 0 or r64(buf, block_start) != size2:
-            raise ValueError('已存在签名块但结构非法')
-        del buf[block_start:cd_off]
-        eocd_off, _ = find_eocd(buf)
-        struct.pack_into('<I', buf, eocd_off + 16, block_start)  # EOCD 回填为真实 CD 起点
-        cd_off = block_start
-    return buf, eocd_off, cd_off
+def _digest_sections(f, ranges, tail_bytes):
+    """流式计算三段摘要：ranges 为文件偏移区间（条目区/CD），tail_bytes 为
+    已打补丁的 EOCD 字节（CD 偏移字段视为签名块起点）。内存占用 O(1MB)。"""
+    digests = []
+    for (start, end) in ranges:
+        if start >= end:
+            digests.append(hashlib.sha256(b'\xa5' + u32(0)).digest())
+            continue
+        pos = start
+        while pos < end:
+            n = min(CHUNK_SIZE, end - pos)
+            f.seek(pos)
+            c = f.read(n)
+            digests.append(hashlib.sha256(b'\xa5' + u32(len(c)) + c).digest())
+            pos += n
+    for c in ([tail_bytes[i:i + CHUNK_SIZE]
+               for i in range(0, len(tail_bytes), CHUNK_SIZE)] or [b'']):
+        digests.append(hashlib.sha256(b'\xa5' + u32(len(c)) + c).digest())
+    h = hashlib.sha256()
+    h.update(b'\x5a')
+    h.update(u32(len(digests)))
+    for d in digests:
+        h.update(d)
+    return h.digest()
 
 
-def sign_v2_inplace(path, key, cert):
+def _build_v2_block(key, cert, digest):
+    """构造 v2 签名块字节（不含落盘布局）。"""
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    with open(path, 'rb') as f:
-        buf = bytearray(f.read())
-    buf, eocd_off, cd_off = strip_existing_v2(buf)
-
-    # 三个 section：① 条目数据 [0, cd_off) ② 中央目录 ③ EOCD
-    # （摘要计算时 EOCD 的 CD 偏移字段视为签名块起始位置 == 插入前的 cd_off，
-    #   即原始 EOCD 字节本身；写入文件的 EOCD 则指向真实 CD 起点）
-    sec1 = bytes(buf[:cd_off])
-    sec2 = bytes(buf[cd_off:eocd_off])
-    sec3 = bytes(buf[eocd_off:])
-    dig96 = chunked_digest(sec1) + chunked_digest(sec2) + chunked_digest(sec3)
-
-    digests_field = lp(lp(u32(RSA_SHA256_PKCS1) + lp(dig96)))
+    digests_field = lp(lp(u32(RSA_SHA256_PKCS1) + lp(digest)))
     cert_der = cert.public_bytes(serialization.Encoding.DER)
     certs_field = lp(lp(cert_der))
     attrs_field = lp(b'')
@@ -474,14 +597,43 @@ def sign_v2_inplace(path, key, cert):
 
     pair = u64(4 + len(block_value)) + u32(V2_SIGNATURE_ID) + block_value
     size_field = len(pair) + 8 + 16  # pairs + 尾部 size + magic
-    block = u64(size_field) + pair + u64(size_field) + V2_BLOCK_MAGIC
+    return u64(size_field) + pair + u64(size_field) + V2_BLOCK_MAGIC
 
-    # 在中央目录前插入签名块，并把 EOCD 的 CD 偏移改为真实 CD 起点
-    buf[cd_off:cd_off] = block
-    struct.pack_into('<I', buf, eocd_off + 16 + len(block), cd_off + len(block))
 
-    with open(path, 'wb') as f:
-        f.write(bytes(buf))
+def _copy_range(fin, fout, start, end, bufsize=8 * 1024 * 1024):
+    pos = start
+    while pos < end:
+        n = min(bufsize, end - pos)
+        fin.seek(pos)
+        fout.write(fin.read(n))
+        pos += n
+
+
+def sign_v2_inplace(path, key, cert):
+    """流式写入 v2 签名块（支持 2GB 级 APK，内存占用 O(1MB)）。
+    已有签名块会被剥离后重签。摘要覆盖：
+      ① 条目区 [0, block_start)  ② 中央目录  ③ EOCD（CD 偏移字段视为 block_start）"""
+    eocd_off, cd_off, fsize = _locate_zip(path)
+    with open(path, 'rb') as f:
+        block_start = _find_block_start(f, cd_off)
+        f.seek(eocd_off)
+        eocd = bytearray(f.read(fsize - eocd_off))
+        struct.pack_into('<I', eocd, 16, block_start)
+        digest = _digest_sections(
+            f, [(0, block_start), (cd_off, eocd_off)], bytes(eocd))
+
+    block = _build_v2_block(key, cert, digest)
+
+    tmp = path + '.v2sign.tmp'
+    with open(path, 'rb') as fin, open(tmp, 'wb') as fout:
+        _copy_range(fin, fout, 0, block_start)       # 条目区（剥离旧块）
+        fout.write(block)                            # 新签名块
+        _copy_range(fin, fout, cd_off, fsize)        # 中央目录 + EOCD
+        new_cd = block_start + len(block)
+        new_eocd_pos = new_cd + (eocd_off - cd_off)
+        fout.seek(new_eocd_pos + 16)
+        fout.write(u32(new_cd))                      # EOCD 指向真实 CD 起点
+    os.replace(tmp, path)
     return len(block)
 
 
@@ -516,22 +668,24 @@ def check_alignment(path):
 
 
 def parse_v2_block(path):
-    """解析 v2 签名块，返回结构化信息（解析器与写入器互为镜像，便于交叉校验）"""
+    """解析 v2 签名块（流式定位，不整读文件）。
+    返回 (info, cd_off, eocd_off)；无签名块时 info=None。"""
+    eocd_off, cd_off, fsize = _locate_zip(path)
     with open(path, 'rb') as f:
-        buf = f.read()
-    eocd_off, cd_off = find_eocd(buf)
-    if buf[cd_off - 16:cd_off] != V2_BLOCK_MAGIC:
-        return None, buf, cd_off, eocd_off
-    size2 = r64(buf, cd_off - 24)
-    block_start = cd_off - 8 - size2  # size2 = pairs + 尾部 size + magic
-    if r64(buf, block_start) != size2:
-        raise ValueError('签名块 size 字段不一致')
+        block_start = _find_block_start(f, cd_off)
+        if block_start == cd_off:
+            return None, cd_off, eocd_off
+        f.seek(block_start + 8)
+        pairs_data = f.read(cd_off - 24 - (block_start + 8))
+        f.seek(eocd_off)
+        eocd = bytearray(f.read(fsize - eocd_off))
+
     pairs = {}
-    pos, end = block_start + 8, cd_off - 24
+    pos, end = 0, len(pairs_data)
     while pos < end:
-        plen = r64(buf, pos)
-        pid = r32(buf, pos + 8)
-        pairs.setdefault(pid, []).append(buf[pos + 12: pos + 8 + plen])
+        plen = r64(pairs_data, pos)
+        pid = r32(pairs_data, pos + 8)
+        pairs.setdefault(pid, []).append(pairs_data[pos + 12: pos + 8 + plen])
         pos += 8 + plen
     v2 = pairs.get(V2_SIGNATURE_ID, [None])[0]
     if v2 is None:
@@ -562,12 +716,13 @@ def parse_v2_block(path):
     sig_algo = r32(sig_one, 0)
     sig_bytes, _ = parse_lp(sig_one, 4)
 
-    return {
+    info = {
         'block_start': block_start, 'block_size': cd_off - block_start,
         'algo': algo, 'digest': dg, 'sig_algo': sig_algo, 'sig': sig_bytes,
         'cert_der': cert_der, 'pubkey_der': pub_der,
         'signed_data_content': sd_content,
-    }, buf, cd_off, eocd_off
+    }
+    return info, cd_off, eocd_off
 
 
 def cmd_verify(args):
@@ -607,25 +762,28 @@ def cmd_verify(args):
 
     # 4. v2 签名
     try:
-        info, buf, cd_off, eocd_off = parse_v2_block(path)
+        info, cd_off, eocd_off = parse_v2_block(path)
     except Exception as e:
         LOG(f'[FAIL] v2 签名块解析: {e}')
-        return 1 if not ok else 1
+        return 1
     if info is None:
         LOG('[FAIL] 未找到 v2 签名块（Android 7+ 无法安装）')
         return 1
 
-    # 重算三段摘要比对（EOCD 的 CD 偏移字段按签名块起始位置取值）
-    sec1 = buf[:info['block_start']]
-    sec2 = buf[cd_off:eocd_off]
-    sec3 = bytearray(buf[eocd_off:])
-    struct.pack_into('<I', sec3, 16, info['block_start'])
-    dig96 = chunked_digest(sec1) + chunked_digest(sec2) + chunked_digest(bytes(sec3))
-    if dig96 != info['digest']:
+    # 流式重算三段摘要比对（EOCD 的 CD 偏移字段按签名块起始位置取值）
+    with open(path, 'rb') as f:
+        f.seek(eocd_off)
+        fsize = f.seek(0, 2)
+        f.seek(eocd_off)
+        eocd = bytearray(f.read(fsize - eocd_off))
+        struct.pack_into('<I', eocd, 16, info['block_start'])
+        digest = _digest_sections(
+            f, [(0, info['block_start']), (cd_off, eocd_off)], bytes(eocd))
+    if digest != info['digest']:
         LOG('[FAIL] APK 内容摘要与签名不符（签名后文件被改动）')
         ok = False
     else:
-        LOG('[PASS] 三段 chunked SHA-256 摘要与签名记录一致')
+        LOG('[PASS] chunked SHA-256 内容摘要与签名记录一致')
 
     try:
         from cryptography import x509
@@ -840,14 +998,17 @@ def cmd_selftest(args):
     check('签名块写入', blen > 0, f'{blen} bytes')
 
     LOG('== 6/6 verify：签名后全量自检 ==')
-    info, buf, cd_off, eocd_off = parse_v2_block(signed)
+    info, cd_off, eocd_off = parse_v2_block(signed)
     check('v2 块可解析', info is not None and info['algo'] == RSA_SHA256_PKCS1)
-    sec1 = buf[:info['block_start']]
-    sec2 = buf[cd_off:eocd_off]
-    sec3 = bytearray(buf[eocd_off:])
-    struct.pack_into('<I', sec3, 16, info['block_start'])
-    dig96 = chunked_digest(sec1) + chunked_digest(sec2) + chunked_digest(bytes(sec3))
-    check('三段摘要一致', dig96 == info['digest'])
+    with open(signed, 'rb') as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        f.seek(eocd_off)
+        eocd = bytearray(f.read(fsize - eocd_off))
+        struct.pack_into('<I', eocd, 16, info['block_start'])
+        digest = _digest_sections(
+            f, [(0, info['block_start']), (cd_off, eocd_off)], bytes(eocd))
+    check('内容摘要一致（0xa5/0x5a 算法）', digest == info['digest'])
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding as apad
     from cryptography.hazmat.primitives.serialization import load_der_public_key
@@ -865,9 +1026,20 @@ def cmd_selftest(args):
     _, problems2 = check_alignment(signed)
     check('签名后对齐保持', not problems2, '; '.join(problems2))
 
+    # 权威交叉校验: apksigner 必须认可自研 v2 签名（防摘要算法回归）
+    import shutil as _sh
+    apksigner = _sh.which('apksigner') or _find_apksigner()
+    if apksigner:
+        r = subprocess.run([apksigner, 'verify', '--min-sdk-version', '24', signed],
+                           capture_output=True, text=True, timeout=120)
+        check('apksigner 权威校验自研 v2 签名', r.returncode == 0,
+              (r.stderr or '')[-200:] if r.returncode else '')
+    else:
+        LOG('  [skip] 未找到 apksigner，跳过权威交叉校验')
+
     # 重签路径（剥离旧块）
     sign_v2_inplace(signed, key, cert)
-    info2, _, _, _ = parse_v2_block(signed)
+    info2, _, _ = parse_v2_block(signed)
     check('重复签名（剥离旧块）', info2 is not None)
     with zipfile.ZipFile(signed) as zf:
         check('重签后 zip 可读', zf.testzip() is None)
