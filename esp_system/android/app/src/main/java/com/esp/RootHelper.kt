@@ -154,6 +154,15 @@ object RootHelper {
             return mkdirResult
         }
 
+        // ---- 部署前强制清理残留进程 (防止 File busy) ----
+        DeployLogger.i("Deploy", "清理旧进程 + 释放文件句柄...")
+        execute("killall -9 tv_reader 2>/dev/null || true")
+        execute("pkill -9 -f tv_reader 2>/dev/null || true")
+        Thread.sleep(350)
+        execute("lsof $TARGET_BIN 2>/dev/null || true")  // 检查是否仍有占用
+        // 强制卸载可能残留的挂载
+        execute("umount $TARGET_DIR 2>/dev/null || true")
+
         try {
             val tmpFile = File(context.cacheDir, "tv_reader_tmp")
             context.assets.open("native/$assetName").use { input ->
@@ -164,11 +173,32 @@ object RootHelper {
             val size = tmpFile.length()
             DeployLogger.i("Deploy", "资产解压到缓存: $size bytes")
 
-            val copyResult = execute("cp ${tmpFile.absolutePath} $TARGET_BIN")
-            DeployLogger.i("Deploy", "cp → $TARGET_BIN ${if (copyResult.success) "OK" else "失败: ${copyResult.output}"}")
-            if (!copyResult.success) {
-                DeployLogger.e("Deploy", "cp 失败: ${copyResult.error} 输出: ${copyResult.output}")
-                return copyResult
+            // ---- 先 rm -f 旧文件 (若无残留进程占用则可删除, 否则 cp 报 File busy) ----
+            execute("rm -f $TARGET_BIN")
+            Thread.sleep(50)
+
+            // cp + 重试 (部分设备在 killall 后仍需短暂等待)
+            var lastCopy: RootResult? = null
+            for (attempt in 1..3) {
+                val copyResult = execute("cp ${tmpFile.absolutePath} $TARGET_BIN")
+                lastCopy = copyResult
+                if (copyResult.success) {
+                    DeployLogger.i("Deploy", "cp → $TARGET_BIN OK (尝试 $attempt)")
+                    break
+                }
+                DeployLogger.w("Deploy", "cp 失败 (尝试 $attempt): ${copyResult.output}")
+                if (attempt < 3) {
+                    Thread.sleep(200L * attempt)
+                    // 重试前再次强制清理
+                    execute("killall -9 tv_reader 2>/dev/null || true")
+                    execute("rm -f $TARGET_BIN")
+                }
+            }
+            if (lastCopy != null && !lastCopy.success) {
+                DeployLogger.e("Deploy", "cp 三次重试均失败: ${lastCopy.output}")
+                val lsofResult = execute("lsof $TARGET_BIN 2>/dev/null || echo (无占用信息)")
+                DeployLogger.e("Deploy", "诊断: lsof → ${lsofResult.output}")
+                return lastCopy
             }
 
             execute("chmod 755 $TARGET_BIN")
@@ -193,9 +223,10 @@ object RootHelper {
     }
 
     fun launchReader(gamePkg: String, port: Int): RootResult {
-        DeployLogger.i("Launch", "清理旧进程...")
-        execute("killall tv_reader 2>/dev/null || true")
-        Thread.sleep(200)
+        DeployLogger.i("Launch", "清理旧进程 (killall + pkill)...")
+        execute("killall -9 tv_reader 2>/dev/null || true")
+        execute("pkill -9 -f tv_reader 2>/dev/null || true")
+        Thread.sleep(400)
 
         val cmd = "$TARGET_BIN --game-pkg $gamePkg --port $port"
         DeployLogger.i("Launch", "启动: nohup $cmd > $LOG_FILE 2>&1 &")
