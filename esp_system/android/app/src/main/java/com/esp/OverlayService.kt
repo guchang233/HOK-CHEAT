@@ -52,6 +52,7 @@ class OverlayService : Service() {
     private var toolbarRoot: FrameLayout? = null
     private var panelScroll: ScrollView? = null
     private var miniPillView: TextView? = null
+    private var toolbarW = 0            // 工具栏展开时固定宽度 (px)
     private var collapsed = false
     private var radarSize = 300
     private var radarShown = true
@@ -312,6 +313,10 @@ class OverlayService : Service() {
         if (toolbarView != null) return
         val ctx = this
 
+        // 固定窗口宽度 (190dp): 窗口永远不可能比它宽, 保证左右两侧有拖动空间
+        val fixedW = HudUi.dp(ctx, 190f).toInt()
+        toolbarW = fixedW
+
         val root = FrameLayout(ctx)
 
         // ---------- 完整面板 (紧凑) ----------
@@ -319,10 +324,9 @@ class OverlayService : Service() {
             orientation = LinearLayout.VERTICAL
             background = HudUi.panelBg(ctx, 14f)
             setPadding(
-                HudUi.dp(ctx, 9f).toInt(), HudUi.dp(ctx, 7f).toInt(),
-                HudUi.dp(ctx, 9f).toInt(), HudUi.dp(ctx, 9f).toInt()
+                HudUi.dp(ctx, 8f).toInt(), HudUi.dp(ctx, 7f).toInt(),
+                HudUi.dp(ctx, 8f).toInt(), HudUi.dp(ctx, 8f).toInt()
             )
-            minimumWidth = HudUi.dp(ctx, 208f).toInt()
         }
 
         // 头部: 拖拽手柄 + 状态点 + 标题 + 折叠
@@ -368,6 +372,7 @@ class OverlayService : Service() {
             textSize = 10f
             setTextColor(HudUi.TEXT_MAIN)
             maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
             setPadding(0, HudUi.dp(ctx, 5f).toInt(), 0, 0)
         }
         tvStatusLine = statusLine
@@ -479,8 +484,18 @@ class OverlayService : Service() {
         panel.addView(r6)
 
         val scroll = ScrollView(ctx).apply { isVerticalScrollBarEnabled = false }
-        scroll.addView(panel)
-        root.addView(scroll)
+        scroll.addView(panel, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(scroll, FrameLayout.LayoutParams(fixedW, FrameLayout.LayoutParams.WRAP_CONTENT))
+        // 内容过高 (横屏小屏) 时限制窗口高度, 面板内部滚动
+        scroll.post {
+            val maxH = (resources.displayMetrics.heightPixels * 0.7f).toInt()
+            if (scroll.height > maxH) {
+                scroll.layoutParams = FrameLayout.LayoutParams(fixedW, maxH)
+            }
+        }
 
         // ---------- 迷你胶囊 ----------
         val mini = TextView(ctx).apply {
@@ -516,7 +531,7 @@ class OverlayService : Service() {
         }
         val dm = resources.displayMetrics
         val tbLp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            fixedW,   // 固定窄宽, 窗口不可能比它宽, 保证左右有拖动空间
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -524,14 +539,15 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            val maxTbX = (dm.widthPixels - fixedW).coerceAtLeast(0)
             val sx = prefs.getInt("tb_x", -1)
             val sy = prefs.getInt("tb_y", -1)
             if (sx >= 0 && sy >= 0) {
-                x = sx.coerceIn(0, dm.widthPixels)
-                y = sy.coerceIn(0, dm.heightPixels)
+                x = sx.coerceIn(0, maxTbX)
+                y = sy.coerceIn(0, dm.heightPixels / 2)
             } else {
                 // 默认停靠右侧
-                x = (dm.widthPixels - HudUi.dp(ctx, 216f)).toInt()
+                x = (dm.widthPixels - fixedW - HudUi.dp(ctx, 6f)).toInt().coerceIn(0, maxTbX)
                 y = dm.heightPixels / 4
             }
         }
@@ -545,18 +561,21 @@ class OverlayService : Service() {
             return
         }
 
-        // 头部拖拽移动 + 双击折叠/展开
+        // 头部/状态行拖拽移动 + 双击折叠/展开
         var downRawX = 0f
         var downRawY = 0f
         var lpStartX = 0
         var lpStartY = 0
         var dragMoved = false
         var lastTapMs = 0L
-        val maxTbX = dm.widthPixels - HudUi.dp(ctx, 48f).toInt()
+        // 全宽活动范围: 窗口宽 = fixedW, x ∈ [0, 屏宽-窗口宽] → 左右可自由拖动
+        val maxTbX = (dm.widthPixels - fixedW).coerceAtLeast(0)
         val maxTbY = dm.heightPixels - HudUi.dp(ctx, 36f).toInt()
-        header.setOnTouchListener { _, ev ->
+        val dragListener = View.OnTouchListener { v, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    // 阻止 ScrollView 拦截手势 (内容可滚动时会抢走拖拽)
+                    v.parent.requestDisallowInterceptTouchEvent(true)
                     downRawX = ev.rawX
                     downRawY = ev.rawY
                     lpStartX = tbLp.x
@@ -596,6 +615,10 @@ class OverlayService : Service() {
                 else -> false
             }
         }
+        header.setOnTouchListener(dragListener)
+        // 状态行/部署行也是拖拽手柄 (扩大可抓取区域, 无交互冲突)
+        statusLine.setOnTouchListener(dragListener)
+        deployLine.setOnTouchListener(dragListener)
 
         // 迷你胶囊: 点按展开, 拖拽移动
         var miniDownX = 0f
@@ -681,6 +704,8 @@ class OverlayService : Service() {
         try {
             val r = toolbarRoot ?: return
             val lp = toolbarParams ?: return
+            // 折叠时窗口收窄为胶囊自身宽度 (不占位); 展开恢复固定宽度
+            lp.width = if (v) WindowManager.LayoutParams.WRAP_CONTENT else toolbarW
             windowManager.updateViewLayout(r, lp)
         } catch (_: Exception) {
         }
@@ -695,10 +720,10 @@ class OverlayService : Service() {
         Thread {
             try {
                 // ---- 阶段 1: Root 授权 ----
-                DeployLogger.i("Deploy", "阶段1/3: 请求 Root 授权...")
+                DeployLogger.i("Deploy", "阶段1/3: 请求 Root 授权 (自动探测 su -c / su 0 / 交互式)...")
                 if (!RootHelper.isRootAvailable()) {
-                    DeployLogger.e("Deploy", "Root 不可用 — su 未安装 / 未授权 / 授权被拒绝")
-                    DeployLogger.e("Deploy", "对策: 确认设备已 Root, 且 Magisk/KernelSU 已对「ESP 透视」授予 Root 权限")
+                    DeployLogger.e("Deploy", "Root 不可用 — 三种 su 模式均未返回 uid=0, 详情见上方探测日志")
+                    DeployLogger.e("Deploy", "对策: ① 模拟器需在系统设置中开启 ROOT 并重启模拟器 (雷电: 设置→其他设置→ROOT权限) ② Magisk/KernelSU 超级用户列表确认已授权本应用")
                     readerStatus = "失败: 未获得 Root (点「日志」查看分析)"
                     return@Thread
                 }

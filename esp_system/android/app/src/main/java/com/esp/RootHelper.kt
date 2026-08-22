@@ -11,18 +11,20 @@ import java.io.InputStreamReader
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
- * Root 操作助手 — 持久 root shell 模式。
+ * Root 操作助手 — 多策略 su 探测 + 命令执行。
  *
- * 关键设计:
- *  1. 整个进程生命周期只拉起一次交互式 `su` — 授权弹窗最多出现一次;
- *  2. 专用读泵线程持续读 shell stdout → 行队列, 主逻辑轮询消费
- *     (readLine 阻塞且无超时, 必须与探测逻辑解耦);
- *  3. 授权探测采用「marker + 周期重发」, 不设 banner 行数上限:
- *     - su 等待授权期间, 先发的探测命令可能被 su 吞掉 → 需重发;
- *     - root 管理器授权后输出的 banner 行数不定 (旧版固定 12 行上限,
- *       授权成功却误判失败 → 杀 shell 重建 → 反复弹授权);
- *     - 只认 `uid=0` / marker 行, 总超时 45s (覆盖用户慢慢点弹窗),
- *       每 1s 重发一次探测命令。
+ * 背景: 不同 root 实现的 su 行为差异巨大 —
+ *  - Magisk/KernelSU/SuperSU: 交互式 shell 与 `su -c` 都支持;
+ *  - 雷电/MuMu 等模拟器自带 root: 常只支持 `su -c` (或 AOSP 语法 `su 0`),
+ *    交互式模式可能既无输出也不报错, 直到内部超时 (~30s) 退出
+ *    (表现为日志 "su 进程已退出 + banner 样例为空");
+ *  - userdebug 系统 su: AOSP 语法 `su 0 <cmd>`。
+ *
+ * 因此按序探测三种模式, 首个返回 uid=0 的生效:
+ *  1. `su -c id`     — 一次性命令模式, 兼容面最广, 优先;
+ *  2. `su 0 id`      — AOSP 原生语法;
+ *  3. 交互式持久 shell — 读泵线程 + 行队列, 授权后常驻复用。
+ * 每一步的输出 / 退出码全部写入部署日志, 失败可直接定位。
  */
 object RootHelper {
     private const val TAG = "ESP-Root"
@@ -34,14 +36,21 @@ object RootHelper {
     private const val PROBE_MARK = "__ESP_PROBE__"
     private const val EOF_MARK = "__ESP_EOF____"
 
-    /** 授权等待总时长: 覆盖用户看到弹窗并点击的时间 */
+    /** 单次 su 探测超时 (覆盖授权弹窗出现 + 用户点击) */
+    private const val PROBE_TIMEOUT_MS = 20_000L
+    /** 交互式 shell 授权等待总时长 */
     private const val SHELL_WAIT_MS = 45_000L
     /** 无响应时探测命令重发间隔 */
     private const val PROBE_RESEND_MS = 1_000L
     /** 单条命令执行超时 */
     private const val CMD_TIMEOUT_MS = 30_000L
 
-    // ---- 持久 root shell ----
+    // ---- su 模式 ----
+    private enum class SuMode { UNKNOWN, ONESHOT_C, ONESHOT_UID, PERSISTENT }
+
+    @Volatile private var suMode = SuMode.UNKNOWN
+
+    // ---- 持久 root shell (仅 PERSISTENT 模式使用) ----
     private var suProcess: Process? = null
     private var suStdin: DataOutputStream? = null
     private var suStdout: BufferedReader? = null
@@ -72,24 +81,99 @@ object RootHelper {
         val error: String
     )
 
+    // ==================== su 模式探测 ====================
+
     /**
-     * 启动 (或复用) 持久 su shell。首次调用时 root 管理器弹一次授权;
-     * 授权后 shell 存活期间不再有任何弹窗。
-     *
-     * 探测协议: `id; echo __ESP_PROBE__` —
-     *   - 读到含 uid=0 的行 → 成功;
-     *   - banner/prompt/回显行一律跳过 (不设行数上限!);
-     *   - 每 1s 无有效响应就重发探测 (授权期间首条命令可能被 su 吞掉);
-     *   - su 进程退出 (拒绝授权) → 立即失败。
+     * 确保 root 可用: 已有生效模式直接复用, 否则按序探测三种 su 语法。
      */
     @Synchronized
     private fun ensureShell(): Boolean {
-        if (shellReady && suProcess != null) return true
+        when (suMode) {
+            SuMode.ONESHOT_C, SuMode.ONESHOT_UID -> return true
+            SuMode.PERSISTENT -> if (shellReady && suProcess != null) return true
+            SuMode.UNKNOWN -> {}
+        }
         killShell()
+        suMode = SuMode.UNKNOWN
+        DeployLogger.i("Root", "--- su 模式探测 (su -c → su 0 → 交互式) ---")
+
+        // 策略 1: su -c (Magisk/KernelSU/模拟器 root 均支持)
+        if (probeOneshot(arrayOf("su", "-c", "id"), "su -c id", SuMode.ONESHOT_C)) return true
+        // 策略 2: AOSP 原生语法 su 0 (userdebug / 部分模拟器)
+        if (probeOneshot(arrayOf("su", "0", "id"), "su 0 id", SuMode.ONESHOT_UID)) return true
+        // 策略 3: 交互式持久 shell
+        if (probePersistent()) {
+            suMode = SuMode.PERSISTENT
+            return true
+        }
+
+        DeployLogger.e("Root", "--- 三种 su 模式均未获得 uid=0 ---")
+        DeployLogger.e("Root", "排查建议: ① 模拟器需在设置中开启 ROOT 并重启模拟器 " +
+                "(雷电: 设置→其他设置→ROOT权限) ② Magisk/KernelSU 的超级用户列表里确认已授权本应用")
+        return false
+    }
+
+    /** 一次性命令探测: 跑一条 `id`, 看输出是否 uid=0。超时/非零退出/非 root 均视为失败。 */
+    private fun probeOneshot(args: Array<String>, desc: String, mode: SuMode): Boolean {
         return try {
-            DeployLogger.i("Root", "拉起 su shell (弹授权框请点允许, 最长等待 ${SHELL_WAIT_MS / 1000}s)...")
+            DeployLogger.i("Root", "探测 [$desc] (最长 ${PROBE_TIMEOUT_MS / 1000}s, 若弹授权框请点允许)...")
+            val p = ProcessBuilder(*args)
+                .redirectErrorStream(true)
+                .start()
+            val sb = StringBuilder()
+            val t = Thread {
+                try {
+                    BufferedReader(InputStreamReader(p.inputStream)).use { r ->
+                        while (true) {
+                            val l = r.readLine() ?: break
+                            sb.appendLine(l)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }.apply { isDaemon = true; start() }
+
+            // 轮询等待退出 (兼容低 API, 不用 waitFor(timeout))
+            val start = SystemClock.elapsedRealtime()
+            var exited = false
+            while (SystemClock.elapsedRealtime() - start < PROBE_TIMEOUT_MS) {
+                try { p.exitValue(); exited = true; break } catch (_: IllegalThreadStateException) {}
+                Thread.sleep(50)
+            }
+            if (!exited) {
+                p.destroyForcibly()
+                DeployLogger.e("Root", "[$desc] ✗ 超时无响应 (可能弹了授权框没点, 或 su 挂起)")
+                return false
+            }
+            t.join(300)
+            val out = sb.toString().trim()
+            val ok = out.contains("uid=0")
+            if (ok) {
+                suMode = mode
+                DeployLogger.i("Root", "[$desc] ✓ 授权成功: ${out.take(80)}")
+            } else {
+                DeployLogger.e("Root", "[$desc] ✗ exit=${p.exitValue()} 输出: ${out.ifEmpty { "(无输出)" }.take(120)}")
+            }
+            ok
+        } catch (e: Exception) {
+            DeployLogger.e("Root", "[$desc] ✗ 异常: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 交互式持久 shell 探测。
+     *
+     * 协议: `id; echo __ESP_PROBE__` —
+     *   - 读到含 uid=0 的行 → 成功;
+     *   - banner/prompt/回显行一律跳过 (不设行数上限);
+     *   - 每 1s 无有效响应就重发探测 (授权期间首条命令可能被 su 吞掉);
+     *   - su 进程退出 (拒绝授权) → 立即失败。
+     */
+    private fun probePersistent(): Boolean {
+        return try {
+            DeployLogger.i("Root", "探测 [交互式 su] (授权框出现请点允许, 最长 ${SHELL_WAIT_MS / 1000}s)...")
             val p = ProcessBuilder("su")
-                .redirectErrorStream(true)   // 合并 stderr, 防止缓冲区涨满死锁
+                .redirectErrorStream(true)
                 .start()
             suProcess = p
             suStdin = DataOutputStream(p.outputStream)
@@ -104,7 +188,7 @@ object RootHelper {
 
             while (SystemClock.elapsedRealtime() - start < SHELL_WAIT_MS) {
                 if (streamEof) {
-                    DeployLogger.e("Root", "su 进程已退出 — 授权被拒绝 / su 异常崩溃")
+                    DeployLogger.e("Root", "[交互式 su] ✗ su 进程已退出 — 授权被拒绝 / 不支持交互模式")
                     break
                 }
                 val line = lineQueue.poll()
@@ -121,15 +205,14 @@ object RootHelper {
                     line.contains("uid=0") -> {
                         drainQueue()
                         shellReady = true
-                        DeployLogger.i("Root", "Root 授权成功: ${line.trim()}")
+                        DeployLogger.i("Root", "[交互式 su] ✓ 授权成功: ${line.trim()}")
                         return true
                     }
                     line.contains("uid=") -> {
-                        DeployLogger.e("Root", "su 返回非 root 身份: $line")
+                        DeployLogger.e("Root", "[交互式 su] ✗ 非 root 身份: $line")
                         return false
                     }
                     line.contains(PROBE_MARK) -> {
-                        // 探测命令执行完却没见到 uid 行 (id 输出被吞/粘连) → 重发
                         sendProbe()
                         lastSend = SystemClock.elapsedRealtime()
                     }
@@ -139,11 +222,11 @@ object RootHelper {
                     }
                 }
             }
-            DeployLogger.e("Root", "su 探测失败: ${SHELL_WAIT_MS / 1000}s 内未读到 uid=0 (banner 样例: ${bannerSample.toString().trim()})")
+            DeployLogger.e("Root", "[交互式 su] ✗ 超时未读到 uid=0 (banner 样例: ${bannerSample.toString().trim()})")
             killShell()
             false
         } catch (e: Exception) {
-            DeployLogger.e("Root", "su shell 启动失败: ${e.message} (su 可能不存在)")
+            DeployLogger.e("Root", "[交互式 su] ✗ 启动失败: ${e.message} (su 可能不存在)")
             Log.w(TAG, "su shell 启动失败: ${e.message}")
             killShell()
             false
@@ -189,7 +272,7 @@ object RootHelper {
         while (lineQueue.poll() != null) { /* drain */ }
     }
 
-    /** 关闭并重置 shell (下次 execute 会重新拉起, 若已授权则静默复权)。 */
+    /** 关闭并重置持久 shell。 */
     @Synchronized
     fun killShell() {
         try { suStdin?.writeBytes("exit\n"); suStdin?.flush() } catch (_: Exception) {}
@@ -203,16 +286,81 @@ object RootHelper {
         streamEof = false
     }
 
+    // ==================== 命令执行 ====================
+
     /**
-     * 在持久 root shell 中执行命令 (marker 协议, 从行队列消费输出)。
-     * 与旧版 su -c 每次新进程不同: 不再反复触发授权弹窗。
+     * 执行 root 命令。自动路由到已探测的 su 模式:
+     *  - ONESHOT_*: 每条命令独立 `su -c "..."` (已授权则零弹窗);
+     *  - PERSISTENT: 复用常驻 shell (marker 协议)。
      */
     @Synchronized
     fun execute(command: String): RootResult {
         if (!ensureShell()) return RootResult(false, "", "未获得 Root 授权")
+        return when (suMode) {
+            SuMode.ONESHOT_C -> executeOneshot(arrayOf("su", "-c"), command)
+            SuMode.ONESHOT_UID -> executeOneshot(arrayOf("su", "0", "sh", "-c"), command)
+            SuMode.PERSISTENT -> executePersistent(command)
+            SuMode.UNKNOWN -> RootResult(false, "", "su 模式未初始化")
+        }
+    }
+
+    /** 一次性模式: `su -c "(cmd) 2>&1; echo MARK:$?"`, 收全部输出后解析 marker。 */
+    private fun executeOneshot(suPrefix: Array<String>, command: String): RootResult {
+        val marker = "CMD_DONE_${System.nanoTime()}"
+        val full = "($command) 2>&1; echo ${marker}:\$?"
+        val args = suPrefix + full
+        return try {
+            val p = ProcessBuilder(*args)
+                .redirectErrorStream(true)
+                .start()
+            val sb = StringBuilder()
+            val t = Thread {
+                try {
+                    BufferedReader(InputStreamReader(p.inputStream)).use { r ->
+                        while (true) {
+                            val l = r.readLine() ?: break
+                            sb.appendLine(l)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }.apply { isDaemon = true; start() }
+
+            val start = SystemClock.elapsedRealtime()
+            var exited = false
+            while (SystemClock.elapsedRealtime() - start < CMD_TIMEOUT_MS) {
+                try { p.exitValue(); exited = true; break } catch (_: IllegalThreadStateException) {}
+                Thread.sleep(25)
+            }
+            if (!exited) {
+                p.destroyForcibly()
+                return RootResult(false, "", "命令超时 (${CMD_TIMEOUT_MS / 1000}s): ${command.take(60)}")
+            }
+            t.join(300)
+
+            var code: Int? = null
+            val outLines = StringBuilder()
+            for (l in sb.lines()) {
+                if (l.startsWith("$marker:")) {
+                    code = l.substring(marker.length + 1).trim().toIntOrNull()
+                } else if (l.isNotBlank() || outLines.isNotEmpty()) {
+                    outLines.appendLine(l)
+                }
+            }
+            if (code == null) {
+                // 无 marker = su 拒绝执行 / shell 异常退出
+                return RootResult(false, sb.toString().trim(),
+                    "su 未返回结果 (可能授权被撤销): ${sb.toString().trim().take(120)}")
+            }
+            RootResult(code == 0, outLines.toString().trim(), "")
+        } catch (e: Exception) {
+            RootResult(false, "", "Root 会话错误: ${e.message}")
+        }
+    }
+
+    /** 持久模式: marker 协议, 从行队列消费输出。 */
+    private fun executePersistent(command: String): RootResult {
         val marker = "CMD_DONE_${System.nanoTime()}"
         return try {
-            // 2>&1 合并错误输出; $? 取 (command) 的退出码
             suStdin!!.writeBytes("($command) 2>&1; echo ${marker}:\$?\n")
             suStdin!!.flush()
             val sb = StringBuilder()
@@ -258,9 +406,8 @@ object RootHelper {
     fun launchTest(): Boolean {
         val r = execute("$TARGET_BIN --help >/dev/null 2>&1; echo TEST_OK:\$?")
         // 输出形如 "TEST_OK:126" — 只有退出码 0 才证明二进制真的可执行
-        // (126=Exec format error/ABI 不匹配, 127=not found, 旧版只查前缀会误判)
+        // (126=Exec format error/ABI 不匹配, 127=not found, 只查前缀会误判)
         val ok = r.output.contains("TEST_OK:0")
-        // 注意: 输出含 "not executable"/"Exec format error" 时说明 ELF 架构不匹配
         DeployLogger.i("Deploy", "ELF 可执行性测试 → ${if (ok) "通过" else "不可执行: ${r.output.take(120)}"}")
         if (!ok && r.output.contains("Format error", true)) {
             DeployLogger.w("Deploy", "Exec format error = ABI 不匹配 (如 ARM 设备上执行 x86 二进制)")
@@ -284,8 +431,7 @@ object RootHelper {
         execute("killall -9 tv_reader 2>/dev/null || true")
         execute("pkill -9 -f tv_reader 2>/dev/null || true")
         Thread.sleep(350)
-        execute("lsof $TARGET_BIN 2>/dev/null || true")  // 检查是否仍有占用
-        // 强制卸载可能残留的挂载
+        execute("lsof $TARGET_BIN 2>/dev/null || true")
         execute("umount $TARGET_DIR 2>/dev/null || true")
 
         try {
@@ -298,11 +444,9 @@ object RootHelper {
             val size = tmpFile.length()
             DeployLogger.i("Deploy", "资产解压到缓存: $size bytes")
 
-            // ---- 先 rm -f 旧文件 (若无残留进程占用则可删除, 否则 cp 报 File busy) ----
             execute("rm -f $TARGET_BIN")
             Thread.sleep(50)
 
-            // cp + 重试 (部分设备在 killall 后仍需短暂等待)
             var lastCopy: RootResult? = null
             for (attempt in 1..3) {
                 val copyResult = execute("cp ${tmpFile.absolutePath} $TARGET_BIN")
@@ -314,7 +458,6 @@ object RootHelper {
                 DeployLogger.w("Deploy", "cp 失败 (尝试 $attempt): ${copyResult.output}")
                 if (attempt < 3) {
                     Thread.sleep(200L * attempt)
-                    // 重试前再次强制清理
                     execute("killall -9 tv_reader 2>/dev/null || true")
                     execute("rm -f $TARGET_BIN")
                 }
@@ -357,7 +500,6 @@ object RootHelper {
         DeployLogger.i("Launch", "启动: nohup $cmd > $LOG_FILE 2>&1 &")
         execute("nohup $cmd > $LOG_FILE 2>&1 &")
 
-        // 启动后多次探测, 给进程初始化留时间 (找不到游戏时 tv_reader 可能先跑几百 ms)
         var running = false
         var psOut = ""
         for (i in 1..3) {
@@ -396,8 +538,8 @@ object RootHelper {
 
     /**
      * 环境诊断 — 收集部署失败分析所需的全部现场信息。
-     * 覆盖: 设备 ABI / Root / SELinux / 挂载 noexec / 游戏安装与进程 /
-     *       读取器进程 / 端口监听 / 磁盘空间。
+     * 覆盖: 设备 ABI / su 位置与版本 / SELinux / 挂载 noexec /
+     *       游戏安装与进程 / 读取器进程 / 端口监听 / 磁盘空间。
      */
     fun diagnose(gamePkg: String, port: Int): String {
         val sb = StringBuilder()
@@ -413,7 +555,8 @@ object RootHelper {
         run("Android", "getprop ro.build.version.release; getprop ro.build.version.sdk")
         run("机型", "getprop ro.product.model; getprop ro.product.manufacturer")
         sec("Root")
-        run("su", "command -v su || which su")
+        run("su 位置", "command -v su; ls -la /system/bin/su /system/xbin/su /sbin/su 2>/dev/null")
+        run("su 版本", "su -v 2>/dev/null || su --version 2>/dev/null || echo 无版本输出")
         run("uid", "id")
         sec("SELinux")
         run("模式", "getenforce")
@@ -455,8 +598,8 @@ object RootHelper {
         if (Regex("noexec").containsMatchIn(diag.substringAfter("/data 挂载", "").substringBefore("====="))) {
             hints.add("/data 分区带 noexec 标志: 该分区下的二进制无法执行 → 需换无 noexec 的目录部署")
         }
-        if (diag.contains("command -v su") && diag.substringAfter("command -v su", "").substringBefore("\n").contains("(无输出)")) {
-            hints.add("su 不存在: 设备未 Root 或 root 管理器异常")
+        if (diag.contains("su 位置") && diag.substringAfter("su 位置", "").substringBefore("\n").contains("(无输出)")) {
+            hints.add("su 不存在: 设备未 Root 或 root 管理器异常 (模拟器需在设置中开启 ROOT 并重启)")
         }
         if (diag.contains("Exec format error", true)) {
             hints.add("ABI 不匹配: 二进制架构与设备 CPU 不符 → 检查是否在 ARM 设备上跑了 x86 模拟器资产 (或反之)")
