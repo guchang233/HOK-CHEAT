@@ -15,6 +15,17 @@ object ReaderClient {
     private var thread: Thread? = null
     @Volatile private var listener: ((EspStatus) -> Unit)? = null
 
+    /** 读满整个 buf (TCP 短读安全); 返回 false = 流断开 */
+    private fun readFully(input: java.io.InputStream, buf: ByteArray): Boolean {
+        var off = 0
+        while (off < buf.size) {
+            val r = input.read(buf, off, buf.size - off)
+            if (r <= 0) return false
+            off += r
+        }
+        return true
+    }
+
     fun start(callback: (EspStatus) -> Unit) {
         if (running) return
         running = true
@@ -30,23 +41,16 @@ object ReaderClient {
                         notify(EspStatus(true, null, "connected"))
                         while (running) {
                             val lenBuf = ByteArray(4)
-                            if (input.read(lenBuf) != 4) break
+                            if (!readFully(input, lenBuf)) break
                             val len = ((lenBuf[0].toInt() and 0xFF) shl 24) or
                                       ((lenBuf[1].toInt() and 0xFF) shl 16) or
                                       ((lenBuf[2].toInt() and 0xFF) shl 8) or
                                       (lenBuf[3].toInt() and 0xFF)
                             if (len <= 0 || len > 65536) break
                             val data = ByteArray(len)
-                            var read = 0
-                            while (read < len) {
-                                val r = input.read(data, read, len - read)
-                                if (r <= 0) break
-                                read += r
-                            }
-                            if (read == len) {
-                                val frame = EspFrame.parse(data)
-                                notify(EspStatus(true, frame, "f${frame.frameId} n=${frame.actors.size}"))
-                            }
+                            if (!readFully(input, data)) break
+                            val frame = EspFrame.parse(data)
+                            notify(EspStatus(true, frame, "f${frame.frameId} n=${frame.actors.size}"))
                         }
                     }
                 } catch (e: Exception) {

@@ -779,6 +779,18 @@ class OverlayService : Service() {
                 if (launchResult.success) {
                     readerStatus = "读取器运行中 ✓"
                     DeployLogger.i("Deploy", "========== 部署成功, 总耗时 ${SystemClock.elapsedRealtime() - t0}ms ==========")
+                    DeployLogger.i("Deploy", "5 秒后自动采集读取器运行状态 (进对局后 actor>0 才会有画面)...")
+                    // 5 秒后自动拉取读取器日志, 让用户直接看到内部扫描状态
+                    mainHandler?.postDelayed({
+                        Thread {
+                            val log = RootHelper.getReaderLog(25)
+                            if (log.isNotBlank() && log != "无日志") {
+                                DeployLogger.i("Reader", "---- 读取器实时状态 ----\n$log")
+                            } else {
+                                DeployLogger.i("Reader", "读取器暂无日志输出 (可能未连上客户端)")
+                            }
+                        }.start()
+                    }, 5000)
                 } else {
                     DeployLogger.e("Deploy", "========== 启动失败 ==========")
                     readerStatus = "启动失败 (点「日志」查看诊断)"

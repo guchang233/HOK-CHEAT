@@ -266,6 +266,8 @@ static uintptr_t g_scan_cursor = 0;
 static int g_scan_range_idx = 0;
 static int g_scan_budget_override = 0;  /* >0: 诊断模式用大预算一次性扫完 */
 static int g_no_throttle = 0;           /* 诊断模式旁路限流 */
+static int g_relaxed_scan = 0;          /* 严格 team 校验一轮无果后降级: 不校验 team */
+static int g_relaxed_announced = 0;     /* 降级只公告一次 */
 
 static int mem_reader_open(MemReader *mr, pid_t pid) {
     mr->pid = pid;
@@ -453,8 +455,14 @@ static int extract_actor_slot(MemReader *mr, uintptr_t aptr, ActorData *a) {
     if (type_id <= 0 || type_id > 500) return 0;  /* not a valid entity type */
 
     int32_t team_id;
-    if (read_i32(mr, aptr + ACTOR_TEAM_OFFSET, &team_id) != 0) return 0;
-    if (team_id != TEAM_ALLY && team_id != TEAM_ENEMY) return 0;
+    if (read_i32(mr, aptr + ACTOR_TEAM_OFFSET, &team_id) != 0) {
+        if (!g_relaxed_scan) return 0;
+        team_id = TEAM_ENEMY;  /* 宽松模式: team 读不到按敌方处理 */
+    }
+    if (team_id != TEAM_ALLY && team_id != TEAM_ENEMY) {
+        if (!g_relaxed_scan) return 0;
+        /* 宽松模式: team 值对不上也收 — 序列化时非 ally 即画成敌方 */
+    }
 
     a->type = type_id;
     a->team_id = team_id;
@@ -591,7 +599,20 @@ static int parse_actors(MemReader *mr, ActorData *actors, int max_actors, int *o
     while (probed < budget) {
         /* 换到下一个有效段 */
         if (g_scan_range_idx >= mr->range_count) {
-            /* 所有段扫完一轮没找到 → 重置从头再来 */
+            /* 所有段扫完一轮没找到 */
+            if (!g_relaxed_scan) {
+                /* 严格模式 (team 必须是 0x40/0x1C) 一轮无果 →
+                   降级宽松模式重扫: 不校验 team, 只靠 type+位置过滤 */
+                g_relaxed_scan = 1;
+                if (!g_relaxed_announced) {
+                    g_relaxed_announced = 1;
+                    fprintf(stderr, "[tv_reader] strict scan pass done, no actor list. "
+                                    "switching to RELAXED scan (no team check)\n");
+                }
+            } else {
+                g_relaxed_announced = 0;  /* 宽松一轮也无果, 回严格再来 */
+                g_relaxed_scan = 0;
+            }
             g_scan_range_idx = 0;
             g_scan_cursor = 0;
             return -1;
@@ -618,7 +639,12 @@ static int parse_actors(MemReader *mr, ActorData *actors, int max_actors, int *o
             if (read_ptr(mr, addr, &ptr0) != 0) continue;   /* 含节流 (-2): 也算消耗预算 */
 
             if (ptr0 == 0) continue;
-            if (ptr0 < r->start || ptr0 >= r->end) continue; /* 必须指向本段内 */
+            /*
+             * 指针数组与 actor 结构体可能在不同 rw 段 (跨段引用完全合法)。
+             * 旧版要求 ptr0 必须落在当前扫描段内 — 跨段引用全被误杀。
+             * 现在只要求落在任意一个已知 rw 段内。
+             */
+            if (!find_range_for_addr(mr->ranges, mr->range_count, ptr0)) continue;
 
             /* 候选列表: 从 addr 起连续提取 */
             int n = harvest_actor_list(mr, addr, actors, max_actors);
@@ -887,11 +913,13 @@ int main(int argc, char **argv) {
         if (game_pid > 0) {
             fprintf(stderr, "[tv_reader] Game PID: %d\n", game_pid);
             if (mem_reader_open(&mr, game_pid) == 0) {
-                fprintf(stderr, "[tv_reader] Memory reader opened, heap: %p-%p\n",
-                        (void *)mr.heap->start, (void *)mr.heap->end);
+                fprintf(stderr, "[tv_reader] Memory reader opened, heap: %p-%p, ranges: %d\n",
+                        (void *)mr.heap->start, (void *)mr.heap->end, mr.range_count);
                 break;
             } else {
-                fprintf(stderr, "[tv_reader] Failed to open process memory (need root?)\n");
+                fprintf(stderr, "[tv_reader] Failed to open process memory: errno=%d (%s)"
+                                " — 检查 SELinux/权限\n",
+                        errno, strerror(errno));
             }
         }
         fprintf(stderr, "[tv_reader] Waiting for game...\n");
@@ -1068,7 +1096,26 @@ int main(int argc, char **argv) {
                 client = -1;
             }
         }
-        
+
+        /*
+         * 周期性状态日志 (每 60 帧 ≈ 2s) — App 日志面板「读取器」tab 实时可见。
+         * 一行讲清: 游戏PID / 本帧actor数 / 缓存命中 / 扫描进度 / 模式 / 客户端。
+         */
+        if (frame_id % 60 == 0) {
+            int ally_n = 0, enemy_n = 0;
+            for (int i = 0; i < actor_count; i++) {
+                if (actors[i].team_id == TEAM_ALLY) ally_n++;
+                else enemy_n++;
+            }
+            fprintf(stderr,
+                    "[tv_reader] st: pid=%d actors=%d(ally=%d,enemy=%d) cache=%s "
+                    "scan=seg%d/%d relaxed=%d client=%s frames=%u\n",
+                    game_pid, actor_count, ally_n, enemy_n,
+                    g_actor_list_cache ? "HIT" : "no",
+                    g_scan_range_idx, mr.range_count, g_relaxed_scan,
+                    client >= 0 ? "on" : "off", frame_id);
+        }
+
         frame_id++;
         usleep(FRAME_INTERVAL_US);
     }
