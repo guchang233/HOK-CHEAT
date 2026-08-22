@@ -29,17 +29,18 @@ class EspCanvasView @JvmOverloads constructor(
         const val MAP_PADDING = 8f
         const val CIRCLE_RADIUS = 6f
 
-        const val BOX_COLOR_ALLY = Color.argb(200, 0, 220, 100)
-        const val BOX_COLOR_ENEMY = Color.argb(200, 255, 60, 60)
-        const val BOX_COLOR_TOWER = Color.argb(180, 255, 200, 50)
-        const val BOX_COLOR_MONSTER = Color.argb(150, 180, 120, 80)
-        const val LINE_COLOR = Color.argb(120, 255, 100, 100)
-        const val ULT_READY_COLOR = Color.argb(220, 255, 200, 0)
-        const val ULT_CD_COLOR = Color.argb(220, 100, 100, 100)
-        const val TIMER_COLOR = Color.argb(200, 255, 180, 50)
-        const val TIMER_BG = Color.argb(120, 20, 20, 20)
-        const val TEXT_COLOR = Color.WHITE
-        const val HP_BG_COLOR = Color.argb(100, 60, 60, 60)
+        // Color.* 是函数/字段调用, 非编译期常量, 不能用 const
+        val BOX_COLOR_ALLY = Color.argb(200, 0, 220, 100)
+        val BOX_COLOR_ENEMY = Color.argb(200, 255, 60, 60)
+        val BOX_COLOR_TOWER = Color.argb(180, 255, 200, 50)
+        val BOX_COLOR_MONSTER = Color.argb(150, 180, 120, 80)
+        val LINE_COLOR = Color.argb(120, 255, 100, 100)
+        val ULT_READY_COLOR = Color.argb(220, 255, 200, 0)
+        val ULT_CD_COLOR = Color.argb(220, 100, 100, 100)
+        val TIMER_COLOR = Color.argb(200, 255, 180, 50)
+        val TIMER_BG = Color.argb(120, 20, 20, 20)
+        val TEXT_COLOR = Color.WHITE
+        val HP_BG_COLOR = Color.argb(100, 60, 60, 60)
 
         val SKILL_NAMES = mapOf(
             105 to "闪现", 106 to "治疗", 107 to "斩杀", 108 to "惩戒",
@@ -159,10 +160,10 @@ class EspCanvasView @JvmOverloads constructor(
         val enemies = actors.filter { !it.ally }
         val allies = actors.filter { it.ally }
 
-        if showLines) drawLines(canvas, enemies)
-        if showMinimap) drawMinimap(canvas, actors)
-        if showBoxes) drawEnhancedBoxes(canvas, actors)
-        if showTimers) drawTimerPanel(canvas, frame.timers, frame.gameTime)
+        if (showLines) drawLines(canvas, enemies)
+        if (showMinimap) drawMinimap(canvas, actors)
+        if (showBoxes) drawEnhancedBoxes(canvas, actors)
+        if (showTimers) drawTimerPanel(canvas, frame.timers, frame.gameTime)
     }
 
     private fun worldToScreen(wx: Float, wz: Float): Pair<Float, Float> {
