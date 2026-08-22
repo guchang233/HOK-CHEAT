@@ -27,6 +27,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.File
 import kotlin.math.abs
 
 class OverlayService : Service() {
@@ -105,6 +106,26 @@ class OverlayService : Service() {
         prefs.edit().putBoolean(key, v).apply()
     }
 
+    /**
+     * 导出读取器二进制到 App 公开外部目录 (无需任何权限)。
+     * 用途: 某些模拟器 (雷电等) 的 su 授权弹窗 UI 有缺陷、授权不持久,
+     * 用户可通过 ADB 手动部署该文件, App 之后只做 TCP 连接, 彻底绕开 root 弹窗。
+     * 导出路径: /sdcard/Android/data/com.esp/files/tv_reader
+     */
+    private fun exportReaderBinary() {
+        try {
+            val asset = RootHelper.pickReaderAsset()
+            val dir = getExternalFilesDir(null) ?: return
+            val f = File(dir, "tv_reader")
+            assets.open("native/$asset").use { input ->
+                f.outputStream().use { input.copyTo(it) }
+            }
+            DeployLogger.i("Deploy", "二进制已导出 (供 ADB 外部部署): $f")
+        } catch (e: Exception) {
+            Log.w(TAG, "二进制导出失败: ${e.message}")
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
@@ -112,6 +133,9 @@ class OverlayService : Service() {
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         mainHandler = Handler(Looper.getMainLooper())
+
+        // 导出读取器二进制到 App 公开目录 — 供 ADB 外部部署使用 (绕开 su 弹窗)
+        exportReaderBinary()
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -193,6 +217,11 @@ class OverlayService : Service() {
             full.updateFrame(status.frame)
             view.updateFrame(status.frame)
             readerConnected = status.connected
+            // 连接成功时更新部署状态 — 外部 (ADB) 部署的读取器无需 App 内 root
+            if (status.connected && !readerStatus.startsWith("✓")) {
+                readerStatus = "✓ 读取器已连接"
+                DeployLogger.i("Reader", "已连接读取器 (127.0.0.1:47291)")
+            }
             val f = status.frame
             if (f != null) {
                 enemyAlive = f.actors.count { !it.ally && it.isHero }
