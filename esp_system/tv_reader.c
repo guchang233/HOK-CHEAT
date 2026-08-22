@@ -589,10 +589,11 @@ static int parse_actors(MemReader *mr, ActorData *actors, int max_actors, int *o
     return found ? 0 : -1;
 }
 
-/* ---- TVEF protocol v2 ---- */
+/* ---- TVEF protocol v3 ---- */
+/* v3: actor 增加 y 坐标 (高度), header 增加 self_y — 供客户端做世界→屏幕投影 */
 
 #define TVEF_MAGIC "TVEF"
-#define TVEF_VERSION 2
+#define TVEF_VERSION 3
 
 #pragma pack(push, 1)
 typedef struct {
@@ -602,12 +603,13 @@ typedef struct {
     float game_time;
     float self_x;
     float self_z;
+    float self_y;
     uint8_t actor_count;
-} TVEFHeaderV2;
+} TVEFHeaderV3;
 
 typedef struct {
     int32_t type;
-    float x, z;
+    float x, z, y;
     uint8_t ally;
     int32_t hp;
     int32_t max_hp;
@@ -625,7 +627,7 @@ typedef struct {
     } skills[MAX_SKILLS_PER_ACTOR];
     float facing_angle;
     float speed;
-} TVEFActorV2;
+} TVEFActorV3;
 
 typedef struct {
     int32_t id;
@@ -636,37 +638,39 @@ typedef struct {
 } TVEFTimer;
 #pragma pack(pop)
 
-static int serialize_frame_v2(const ActorData *actors, int count,
+static int serialize_frame_v3(const ActorData *actors, int count,
                               const GlobalTimer *timers, int timer_count,
-                              float game_time, float self_x, float self_z,
+                              float game_time, float self_x, float self_z, float self_y,
                               uint32_t frame_id,
                               uint8_t *out, size_t out_size) {
-    size_t actor_bytes = (size_t)clamp_i(count, 0, MAX_ACTORS) * sizeof(TVEFActorV2);
+    size_t actor_bytes = (size_t)clamp_i(count, 0, MAX_ACTORS) * sizeof(TVEFActorV3);
     size_t timer_bytes = (size_t)clamp_i(timer_count, 0, MAX_GLOBAL_TIMERS) * sizeof(TVEFTimer);
-    size_t total = sizeof(TVEFHeaderV2) + actor_bytes + 1 + timer_bytes;
-    
+    size_t total = sizeof(TVEFHeaderV3) + actor_bytes + 1 + timer_bytes;
+
     if (total > out_size - 4) return -1;
-    
+
     uint8_t *pkt = out + 4;
     memset(pkt, 0, total);
-    
-    TVEFHeaderV2 *hdr = (TVEFHeaderV2 *)pkt;
+
+    TVEFHeaderV3 *hdr = (TVEFHeaderV3 *)pkt;
     memcpy(hdr->magic, TVEF_MAGIC, 4);
     hdr->version = TVEF_VERSION;
     hdr->frame_id = frame_id;
     hdr->game_time = game_time;
     hdr->self_x = self_x;
     hdr->self_z = self_z;
+    hdr->self_y = self_y;
     hdr->actor_count = (uint8_t)clamp_i(count, 0, MAX_ACTORS);
-    
-    uint8_t *aptr = pkt + sizeof(TVEFHeaderV2);
+
+    uint8_t *aptr = pkt + sizeof(TVEFHeaderV3);
     for (int i = 0; i < hdr->actor_count; i++) {
         const ActorData *src = &actors[i];
-        TVEFActorV2 *dst = (TVEFActorV2 *)aptr;
-        
+        TVEFActorV3 *dst = (TVEFActorV3 *)aptr;
+
         dst->type = src->type;
         dst->x = src->x;
         dst->z = src->z;
+        dst->y = src->y;
         dst->ally = (src->team_id == TEAM_ALLY) ? 1 : 0;
         dst->hp = src->hp;
         dst->max_hp = src->max_hp;
@@ -676,7 +680,7 @@ static int serialize_frame_v2(const ActorData *actors, int count,
         dst->ultimate_cd = src->ultimate_cd;
         dst->ultimate_total = src->ultimate_total;
         dst->skill_count = (uint8_t)clamp_i(src->skill_count, 0, MAX_SKILLS_PER_ACTOR);
-        
+
         for (int si = 0; si < MAX_SKILLS_PER_ACTOR; si++) {
             if (si < src->skill_count) {
                 dst->skills[si].spell_id = src->skills[si].spell_id;
@@ -685,12 +689,12 @@ static int serialize_frame_v2(const ActorData *actors, int count,
                 dst->skills[si].ready = src->skills[si].ready ? 1 : 0;
             }
         }
-        
+
         dst->facing_angle = src->facing_angle;
         dst->speed = src->speed;
-        aptr += sizeof(TVEFActorV2);
+        aptr += sizeof(TVEFActorV3);
     }
-    
+
     uint8_t *tptr = aptr;
     tptr[0] = (uint8_t)clamp_i(timer_count, 0, MAX_GLOBAL_TIMERS);
     tptr += 1;
@@ -703,7 +707,7 @@ static int serialize_frame_v2(const ActorData *actors, int count,
         strncpy(dst->label, timers[t].label, 11);
         tptr += sizeof(TVEFTimer);
     }
-    
+
     uint32_t net_size = (uint32_t)total;
     memcpy(out, &net_size, 4);
     return (int)(4 + total);
@@ -898,10 +902,10 @@ int main(int argc, char **argv) {
     uint8_t tx_buf[65536];
     int client = -1;
     float game_time = 0.0f;
-    float self_x = 0.0f, self_z = 0.0f;
-    
+    float self_x = 0.0f, self_z = 0.0f, self_y = 0.0f;
+
     while (g_running) {
-        /* 
+        /*
          * Check if game process is still alive.
          * If game restarts, we need to re-detect.
          */
@@ -919,7 +923,7 @@ int main(int argc, char **argv) {
                 continue;
             }
         }
-        
+
         /* Accept client connection */
         if (client < 0) {
             fd_set fds;
@@ -939,55 +943,57 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        
+
         if (client < 0) {
             usleep(FRAME_INTERVAL_US);
             continue;
         }
-        
+
         /* Parse actors from game memory */
         int actor_count = 0;
         int pr = parse_actors(&mr, actors, MAX_ACTORS, &actor_count);
-        
+
         /* Extract self position from first ally hero */
         for (int i = 0; i < actor_count; i++) {
             if (actors[i].team_id == TEAM_ALLY && actors[i].type >= 1 && actors[i].type <= 50) {
                 self_x = actors[i].x;
                 self_z = actors[i].z;
+                self_y = actors[i].y;
                 break;
             }
         }
-        
+
         /* Scan global timers */
         int timer_count = scan_global_timers(&mr, timers);
-        
+
         /* Read game time */
         float gt;
         uintptr_t gt_addr = (mr.heap ? mr.heap->start : 0) + GAMESTATE_TIME_OFFSET;
         if (read_f32(&mr, gt_addr, &gt) == 0 && gt >= 0.0f && gt < 7200.0f) {
             game_time = gt;
         }
-        
+
         /* Serialize frame */
         int frame_len = 0;
         if (pr == 0 && (actor_count > 0 || timer_count > 0)) {
-            frame_len = serialize_frame_v2(actors, actor_count,
+            frame_len = serialize_frame_v3(actors, actor_count,
                                            timers, timer_count,
-                                           game_time, self_x, self_z,
+                                           game_time, self_x, self_z, self_y,
                                            frame_id, tx_buf, sizeof(tx_buf));
         } else {
             uint8_t *pkt = tx_buf + 4;
-            memset(pkt, 0, sizeof(TVEFHeaderV2) + 1);
-            TVEFHeaderV2 *hdr = (TVEFHeaderV2 *)pkt;
+            memset(pkt, 0, sizeof(TVEFHeaderV3) + 1);
+            TVEFHeaderV3 *hdr = (TVEFHeaderV3 *)pkt;
             memcpy(hdr->magic, TVEF_MAGIC, 4);
             hdr->version = TVEF_VERSION;
             hdr->frame_id = frame_id;
             hdr->game_time = game_time;
             hdr->self_x = self_x;
             hdr->self_z = self_z;
+            hdr->self_y = self_y;
             hdr->actor_count = 0;
-            pkt[sizeof(TVEFHeaderV2)] = (uint8_t)timer_count;
-            size_t pkt_size = sizeof(TVEFHeaderV2) + 1 + (size_t)timer_count * sizeof(TVEFTimer);
+            pkt[sizeof(TVEFHeaderV3)] = (uint8_t)timer_count;
+            size_t pkt_size = sizeof(TVEFHeaderV3) + 1 + (size_t)timer_count * sizeof(TVEFTimer);
             uint32_t net_size = (uint32_t)pkt_size;
             memcpy(tx_buf, &net_size, 4);
             frame_len = (int)(4 + pkt_size);

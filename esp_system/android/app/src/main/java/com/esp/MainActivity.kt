@@ -41,7 +41,7 @@ class MainActivity : AppCompatActivity() {
             letterSpacing = 0.08f
         })
         root.addView(TextView(ctx).apply {
-            text = "战术雷达 · 悬浮 HUD · TVEF v2"
+            text = "屏幕透视 · 战术雷达 · 悬浮 HUD · TVEF v3"
             textSize = 13f
             setTextColor(HudUi.TEXT_DIM)
             setPadding(0, HudUi.dp(ctx, 4f).toInt(), 0, 0)
@@ -103,12 +103,12 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, HudUi.dp(ctx, 18f).toInt(), 0, HudUi.dp(ctx, 6f).toInt())
         })
         card.addView(TextView(ctx).apply {
-            text = "1. 点「启动透视悬浮窗」，首次需授予悬浮窗权限\n" +
-                "2. 悬浮窗工具栏点「部署」，首次需 Root 授权（仅一次）\n" +
-                "3. 启动游戏进入对局，雷达自动显示敌我位置\n" +
-                "4. 拖动工具栏顶部「≡」可移动位置，双击标题折叠\n" +
-                "5. 部署失败时点「日志」查看原因分析与环境诊断\n" +
-                "6. 日志同步落盘: Android/data/com.esp.overlay/files/deploy_log.txt"
+            text = "1. 点「启动悬浮窗」，授予悬浮窗权限\n" +
+                "2. 工具栏点「部署」，Root 授权仅首次\n" +
+                "3. 进游戏对局 — 敌人方框/血条/技能CD直接绘制在游戏画面上\n" +
+                "4. 「透视」总开关 + 12 项绘制开关（方框/血条/技能/大招/等级/距离/朝向/连线/友军/野怪）\n" +
+                "5. 拖「≡」移动工具栏，双击标题折叠为迷你胶囊\n" +
+                "6. 部署失败点「日志」查看原因分析；雷达可独立开关、±调大小"
             textSize = 13f
             setTextColor(HudUi.TEXT_MAIN)
             setLineSpacing(HudUi.dp(ctx, 3f), 1f)

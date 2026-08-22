@@ -32,11 +32,11 @@ import kotlin.math.abs
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private var espView: EspCanvasView? = null
+
+    // ---- 悬浮窗组件 ----
+    private var espFullScreen: EspOverlayView? = null     // 全屏 ESP (游戏画面直绘)
+    private var espView: EspCanvasView? = null            // 小雷达
     private var params: WindowManager.LayoutParams? = null
-    private val prefs: SharedPreferences by lazy {
-        getSharedPreferences("esp_overlay", Context.MODE_PRIVATE)
-    }
 
     private var toolbarView: View? = null
     private var toolbarParams: WindowManager.LayoutParams? = null
@@ -54,14 +54,21 @@ class OverlayService : Service() {
     private var miniPillView: TextView? = null
     private var collapsed = false
     private var radarSize = 300
+    private var radarShown = true
     private var mainHandler: Handler? = null
     private var statusRunnable: Runnable? = null
     private var pulseAnim: ValueAnimator? = null
     private var statusDotDrawable: GradientDrawable? = null
+    private var tvStatusLine: TextView? = null
+    private var tvDeployLine: TextView? = null
 
     private val TAG = "ESP-Overlay"
     private val CHANNEL_ID = "esp_overlay"
     private val NOTIF_ID = 1
+
+    private val prefs: SharedPreferences by lazy {
+        getSharedPreferences("esp_overlay", Context.MODE_PRIVATE)
+    }
 
     companion object {
         const val ACTION_STOP = "com.esp.STOP_OVERLAY"
@@ -79,17 +86,6 @@ class OverlayService : Service() {
 
         @Volatile var isRunning = false
 
-        // 显示开关
-        @Volatile var showRadar = true
-        @Volatile var showLines = true
-        @Volatile var showHp = true
-        @Volatile var showSkills = true
-        @Volatile var showUlt = true
-        @Volatile var showTimers = true
-        @Volatile var showLevels = true
-        @Volatile var showDist = true
-        @Volatile var showFacing = true
-
         @Volatile var lastLog = ""
         @Volatile var readerStatus = "未部署"
 
@@ -100,20 +96,21 @@ class OverlayService : Service() {
         @Volatile var allyAlive = 0
     }
 
+    // ==================== 开关持久化 ====================
+    private fun boolPref(key: String, def: Boolean): Boolean =
+        prefs.getBoolean(key, def)
+
+    private fun saveBool(key: String, v: Boolean) {
+        prefs.edit().putBoolean(key, v).apply()
+    }
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         startInForeground()
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-        val view = EspCanvasView(this)
-        espView = view
-
-        // 雷达尺寸以 dp 为存储单位, 换算 px (高密度屏不至于过小)
-        val radarDp = prefs.getInt("radar", 300).coerceIn(200, 640)
-        radarSize = HudUi.dp(this, radarDp.toFloat()).toInt()
-        view.setMapSize(radarSize)
+        mainHandler = Handler(Looper.getMainLooper())
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -122,9 +119,49 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+        // ---------- 1. 全屏 ESP 层 (游戏画面直绘, 不拦截触摸) ----------
+        val full = EspOverlayView(this).apply {
+            config.espOn = boolPref("cfg_esp", true)
+            config.showBox = boolPref("cfg_box", true)
+            config.showHp = boolPref("cfg_hp", true)
+            config.showSkills = boolPref("cfg_skills", true)
+            config.showUlt = boolPref("cfg_ult", true)
+            config.showLevel = boolPref("cfg_level", true)
+            config.showDist = boolPref("cfg_dist", false)
+            config.showFacing = boolPref("cfg_facing", false)
+            config.showLines = boolPref("cfg_lines", false)
+            config.showHidden = boolPref("cfg_hidden", true)
+            config.showAlly = boolPref("cfg_ally", false)
+            config.showMinions = boolPref("cfg_minions", false)
+        }
+        espFullScreen = full
+        val fullLp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        try {
+            windowManager.addView(full, fullLp)
+        } catch (e: Exception) {
+            Log.w(TAG, "全屏 ESP 层挂载失败", e)
+        }
+
+        // ---------- 2. 小雷达 (独立窗口, 可开关/拖动) ----------
+        val view = EspCanvasView(this)
+        espView = view
+        val radarDp = prefs.getInt("radar", 132).coerceIn(100, 320)
+        radarSize = HudUi.dp(this, radarDp.toFloat()).toInt()
+        view.setMapSize(radarSize)
+        radarShown = boolPref("cfg_radar", true)
+
         val savedX = prefs.getInt("x", 32)
         val savedY = prefs.getInt("y", 100)
-
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -140,12 +177,19 @@ class OverlayService : Service() {
             y = savedY
         }
         params = lp
-        windowManager.addView(view, lp)
+        if (radarShown) {
+            try {
+                windowManager.addView(view, lp)
+            } catch (e: Exception) {
+                Log.w(TAG, "雷达挂载失败", e)
+            }
+        }
 
-        // 读取器数据回调 + 实时统计
+        // ---------- 3. 读取器数据回调 ----------
         var frames = 0
         var lastMs = 0L
         ReaderClient.start { status ->
+            full.updateFrame(status.frame)
             view.updateFrame(status.frame)
             readerConnected = status.connected
             val f = status.frame
@@ -197,25 +241,55 @@ class OverlayService : Service() {
         }
     }
 
+    /** 雷达大小调节 (dp 步进, 100-320) */
+    private fun adjustRadar(deltaDp: Int) {
+        val curDp = (radarSize / resources.displayMetrics.density).toInt()
+        val newDp = (curDp + deltaDp).coerceIn(100, 320)
+        radarSize = HudUi.dp(this, newDp.toFloat()).toInt()
+        espView?.setMapSize(radarSize)
+        prefs.edit().putInt("radar", newDp).apply()
+    }
+
+    /** 显示/隐藏雷达窗口 */
+    private fun setRadarShown(v: Boolean) {
+        radarShown = v
+        saveBool("cfg_radar", v)
+        val view = espView ?: return
+        val lp = params ?: return
+        try {
+            if (v) {
+                if (view.windowToken == null || view.parent == null) {
+                    windowManager.addView(view, lp)
+                } else {
+                    view.visibility = View.VISIBLE
+                }
+            } else {
+                if (view.parent != null) {
+                    windowManager.removeView(view)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "雷达开关失败", e)
+        }
+    }
+
     override fun onDestroy() {
         isRunning = false
         statusRunnable?.let { mainHandler?.removeCallbacks(it) }
         pulseAnim?.cancel()
         ReaderClient.stop()
         RootHelper.killShell()
+        espFullScreen?.let {
+            try { windowManager.removeView(it) } catch (_: Exception) {}
+        }
         espView?.let {
-            try {
-                windowManager.removeView(it)
-            } catch (_: Exception) {
-            }
+            try { windowManager.removeView(it) } catch (_: Exception) {}
         }
         toolbarView?.let {
-            try {
-                windowManager.removeView(it)
-            } catch (_: Exception) {
-            }
+            try { windowManager.removeView(it) } catch (_: Exception) {}
         }
         hideLogPanel()
+        espFullScreen = null
         espView = null
         toolbarView = null
         toolbarRoot = null
@@ -232,23 +306,22 @@ class OverlayService : Service() {
         startService(intent)
     }
 
-    // ==================== 工具栏 (战术玻璃 HUD) ====================
+    // ==================== 紧凑工具栏 ====================
     private fun showToolbar() {
         if (toolbarView != null) return
         val ctx = this
-        mainHandler = Handler(Looper.getMainLooper())
 
         val root = FrameLayout(ctx)
 
-        // ---------- 完整面板 ----------
+        // ---------- 完整面板 (紧凑) ----------
         val panel = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            background = HudUi.panelBg(ctx, 16f)
+            background = HudUi.panelBg(ctx, 14f)
             setPadding(
-                HudUi.dp(ctx, 12f).toInt(), HudUi.dp(ctx, 10f).toInt(),
-                HudUi.dp(ctx, 12f).toInt(), HudUi.dp(ctx, 12f).toInt()
+                HudUi.dp(ctx, 9f).toInt(), HudUi.dp(ctx, 7f).toInt(),
+                HudUi.dp(ctx, 9f).toInt(), HudUi.dp(ctx, 9f).toInt()
             )
-            minimumWidth = HudUi.dp(ctx, 244f).toInt()
+            minimumWidth = HudUi.dp(ctx, 208f).toInt()
         }
 
         // 头部: 拖拽手柄 + 状态点 + 标题 + 折叠
@@ -264,90 +337,76 @@ class OverlayService : Service() {
         }
         header.addView(TextView(ctx).apply {
             text = "≡"
-            textSize = 14f
+            textSize = 13f
             setTextColor(HudUi.TEXT_DIM)
         })
-        val dotSize = HudUi.dp(ctx, 8f).toInt()
+        val dotSize = HudUi.dp(ctx, 7f).toInt()
         header.addView(View(ctx).apply {
             background = dotDrawable
             layoutParams = LinearLayout.LayoutParams(dotSize, dotSize).apply {
-                marginStart = HudUi.dp(ctx, 8f).toInt()
+                marginStart = HudUi.dp(ctx, 7f).toInt()
             }
         })
         header.addView(TextView(ctx).apply {
-            text = "ESP 透视"
-            textSize = 14f
+            text = "ESP"
+            textSize = 13f
             setTextColor(HudUi.TEXT_MAIN)
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { marginStart = HudUi.dp(ctx, 8f).toInt() }
+            ).apply { marginStart = HudUi.dp(ctx, 7f).toInt() }
         })
         header.addView(View(ctx), LinearLayout.LayoutParams(0, 1, 1f))
         header.addView(HudUi.actionButton(ctx, "—") { setCollapsed(!collapsed) })
         panel.addView(header)
 
-        // 分隔线
-        panel.addView(View(ctx).apply {
-            setBackgroundColor(HudUi.STROKE_DIM)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, HudUi.dp(ctx, 1f).toInt()
-            ).apply { topMargin = HudUi.dp(ctx, 8f).toInt() }
-        })
-
-        // 状态芯片行
-        fun chip(initial: String): TextView = TextView(ctx).apply {
-            text = initial
+        // 状态行 (1 行小字: 连接 + FPS + 敌我)
+        val statusLine = TextView(ctx).apply {
+            text = "连接 --  FPS --  敌 - 我 -"
             textSize = 10f
             setTextColor(HudUi.TEXT_MAIN)
-            typeface = Typeface.DEFAULT_BOLD
-            background = HudUi.chipBg(ctx)
-            setPadding(
-                HudUi.dp(ctx, 8f).toInt(), HudUi.dp(ctx, 3f).toInt(),
-                HudUi.dp(ctx, 8f).toInt(), HudUi.dp(ctx, 3f).toInt()
-            )
+            maxLines = 1
+            setPadding(0, HudUi.dp(ctx, 5f).toInt(), 0, 0)
         }
-        fun chipLp() = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { marginEnd = HudUi.dp(ctx, 6f).toInt() }
+        tvStatusLine = statusLine
+        panel.addView(statusLine)
 
-        val tvReader = chip("读取器 --")
-        val tvFps = chip("FPS --")
-        val tvCount = chip("敌 - / 我 -")
-        val chipRow = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, HudUi.dp(ctx, 8f).toInt(), 0, 0)
-        }
-        chipRow.addView(tvReader, chipLp())
-        chipRow.addView(tvFps, chipLp())
-        chipRow.addView(tvCount, chipLp())
-        panel.addView(chipRow)
-
-        val tvStatusFull = TextView(ctx).apply {
+        // 部署状态行
+        val deployLine = TextView(ctx).apply {
             text = readerStatus
-            textSize = 10f
+            textSize = 9f
             setTextColor(HudUi.TEXT_DIM)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-            setPadding(0, HudUi.dp(ctx, 4f).toInt(), 0, 0)
         }
-        panel.addView(tvStatusFull)
+        tvDeployLine = deployLine
+        panel.addView(deployLine)
 
-        // 动作按钮行
-        fun actionRow(): LinearLayout = LinearLayout(ctx).apply {
+        // 主开关行: 透视总开关 + 雷达
+        val cfg = espFullScreen?.config
+        val mainRow = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, HudUi.dp(ctx, 8f).toInt(), 0, 0)
+            setPadding(0, HudUi.dp(ctx, 6f).toInt(), 0, 0)
         }
+        mainRow.addView(PillToggle(ctx, "透视", cfg?.espOn ?: true) { v ->
+            espFullScreen?.config?.espOn = v
+            espFullScreen?.postInvalidate()
+            saveBool("cfg_esp", v)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.35f))
+        mainRow.addView(PillToggle(ctx, "雷达", radarShown) { v -> setRadarShown(v) },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        panel.addView(mainRow)
+
+        // 按钮行: 部署 | 日志 | 停止
         fun weightLp() = LinearLayout.LayoutParams(
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-        ).apply { marginEnd = HudUi.dp(ctx, 6f).toInt() }
-        fun lastWeightLp() = LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-        )
+        ).apply { marginEnd = HudUi.dp(ctx, 5f).toInt() }
 
-        val rowA = actionRow()
+        val rowA = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, HudUi.dp(ctx, 6f).toInt(), 0, 0)
+        }
         rowA.addView(HudUi.actionButton(ctx, "部署") {
             readerStatus = "部署中..."
             sendServiceAction(ACTION_DEPLOY_READER)
@@ -355,76 +414,68 @@ class OverlayService : Service() {
         rowA.addView(HudUi.actionButton(ctx, "日志") {
             sendServiceAction(ACTION_LOG_READER)
         }, weightLp())
-        rowA.addView(HudUi.actionButton(ctx, "居中") {
-            sendServiceAction(ACTION_CENTER)
-        }, lastWeightLp())
+        rowA.addView(HudUi.dangerButton(ctx, "停止") {
+            sendServiceAction(ACTION_STOP_READER)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         panel.addView(rowA)
 
-        val rowB = actionRow()
-        rowB.addView(HudUi.actionButton(ctx, "雷达 −") {
-            adjustRadar(-40)
-        }, weightLp())
-        rowB.addView(HudUi.actionButton(ctx, "雷达 ＋") {
-            adjustRadar(40)
-        }, weightLp())
-        rowB.addView(HudUi.dangerButton(ctx, "停止读取器") {
-            sendServiceAction(ACTION_STOP_READER)
-        }, lastWeightLp())
-        panel.addView(rowB)
-
-        // 开关区
+        // 绘制项标签
         panel.addView(TextView(ctx).apply {
-            text = "战场显示"
-            textSize = 10f
+            text = "屏幕绘制项"
+            textSize = 9f
             setTextColor(HudUi.TEXT_DIM)
             letterSpacing = 0.12f
-            setPadding(0, HudUi.dp(ctx, 10f).toInt(), 0, HudUi.dp(ctx, 4f).toInt())
+            setPadding(0, HudUi.dp(ctx, 8f).toInt(), 0, HudUi.dp(ctx, 2f).toInt()
+            )
         })
 
-        fun toggleRow(a: PillToggle, b: PillToggle?): LinearLayout {
-            val r = LinearLayout(ctx).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(0, HudUi.dp(ctx, 2f).toInt(), 0, HudUi.dp(ctx, 2f).toInt())
-            }
-            r.addView(a, LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            if (b != null) {
-                r.addView(b, LinearLayout.LayoutParams(
-                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            }
-            return r
+        // 开关网格 (2 列) — 全部作用于全屏 ESP 层
+        fun toggleRow(): LinearLayout = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, HudUi.dp(ctx, 1f).toInt(), 0, HudUi.dp(ctx, 1f).toInt())
         }
+        fun cell(parent: LinearLayout, weight: Float = 1f) = LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, weight
+        )
 
-        panel.addView(toggleRow(
-            PillToggle(ctx, "雷达", showRadar) { v -> showRadar = v; espView?.setRadar(v) },
-            PillToggle(ctx, "连线", showLines) { v -> showLines = v; espView?.setLines(v) }
-        ))
-        panel.addView(toggleRow(
-            PillToggle(ctx, "血量环", showHp) { v -> showHp = v; espView?.setHp(v) },
-            PillToggle(ctx, "技能", showSkills) { v -> showSkills = v; espView?.setSkills(v) }
-        ))
-        panel.addView(toggleRow(
-            PillToggle(ctx, "大招", showUlt) { v -> showUlt = v; espView?.setUlt(v) },
-            PillToggle(ctx, "计时", showTimers) { v -> showTimers = v; espView?.setTimers(v) }
-        ))
-        panel.addView(toggleRow(
-            PillToggle(ctx, "等级", showLevels) { v -> showLevels = v; espView?.setLevels(v) },
-            PillToggle(ctx, "距离", showDist) { v -> showDist = v; espView?.setDist(v) }
-        ))
-        panel.addView(toggleRow(
-            PillToggle(ctx, "朝向", showFacing) { v -> showFacing = v; espView?.setFacing(v) },
-            null
-        ))
+        fun espToggle(label: String, key: String, def: Boolean, setter: (Boolean) -> Unit): PillToggle =
+            PillToggle(ctx, label, boolPref(key, def), compact = true) { v ->
+                setter(v)
+                saveBool(key, v)
+                espFullScreen?.postInvalidate()
+            }
 
-        // 停止按钮
-        panel.addView(HudUi.dangerButton(ctx, "⏹ 停止透视") {
-            stopSelf()
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = HudUi.dp(ctx, 12f).toInt() }
-        })
+        val r1 = toggleRow()
+        r1.addView(espToggle("方框", "cfg_box", true) { espFullScreen?.config?.showBox = it }, cell(r1))
+        r1.addView(espToggle("血条", "cfg_hp", true) { espFullScreen?.config?.showHp = it }, cell(r1))
+        panel.addView(r1)
+
+        val r2 = toggleRow()
+        r2.addView(espToggle("技能", "cfg_skills", true) { espFullScreen?.config?.showSkills = it }, cell(r2))
+        r2.addView(espToggle("大招", "cfg_ult", true) { espFullScreen?.config?.showUlt = it }, cell(r2))
+        panel.addView(r2)
+
+        val r3 = toggleRow()
+        r3.addView(espToggle("等级", "cfg_level", true) { espFullScreen?.config?.showLevel = it }, cell(r3))
+        r3.addView(espToggle("距离", "cfg_dist", false) { espFullScreen?.config?.showDist = it }, cell(r3))
+        panel.addView(r3)
+
+        val r4 = toggleRow()
+        r4.addView(espToggle("朝向", "cfg_facing", false) { espFullScreen?.config?.showFacing = it }, cell(r4))
+        r4.addView(espToggle("连线", "cfg_lines", false) { espFullScreen?.config?.showLines = it }, cell(r4))
+        panel.addView(r4)
+
+        val r5 = toggleRow()
+        r5.addView(espToggle("友军", "cfg_ally", false) { espFullScreen?.config?.showAlly = it }, cell(r5))
+        r5.addView(espToggle("野怪", "cfg_minions", false) { espFullScreen?.config?.showMinions = it }, cell(r5))
+        panel.addView(r5)
+
+        // 雷达大小行
+        val r6 = toggleRow().apply { setPadding(0, HudUi.dp(ctx, 4f).toInt(), 0, 0) }
+        r6.addView(HudUi.actionButton(ctx, "雷达 −") { adjustRadar(-32) }, weightLp())
+        r6.addView(HudUi.actionButton(ctx, "雷达 ＋") { adjustRadar(32) },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        panel.addView(r6)
 
         val scroll = ScrollView(ctx).apply { isVerticalScrollBarEnabled = false }
         scroll.addView(panel)
@@ -433,17 +484,17 @@ class OverlayService : Service() {
         // ---------- 迷你胶囊 ----------
         val mini = TextView(ctx).apply {
             text = "ESP"
-            textSize = 12f
+            textSize = 11f
             setTextColor(HudUi.TEXT_MAIN)
             typeface = Typeface.DEFAULT_BOLD
             background = GradientDrawable().apply {
                 setColor(HudUi.BG_PANEL)
-                cornerRadius = HudUi.dp(ctx, 18f)
+                cornerRadius = HudUi.dp(ctx, 16f)
                 setStroke(HudUi.dp(ctx, 1f).toInt(), HudUi.STROKE_HOT)
             }
             setPadding(
-                HudUi.dp(ctx, 14f).toInt(), HudUi.dp(ctx, 6f).toInt(),
-                HudUi.dp(ctx, 14f).toInt(), HudUi.dp(ctx, 6f).toInt()
+                HudUi.dp(ctx, 12f).toInt(), HudUi.dp(ctx, 5f).toInt(),
+                HudUi.dp(ctx, 12f).toInt(), HudUi.dp(ctx, 5f).toInt()
             )
             visibility = View.GONE
         }
@@ -478,8 +529,8 @@ class OverlayService : Service() {
                 x = sx.coerceIn(0, dm.widthPixels)
                 y = sy.coerceIn(0, dm.heightPixels)
             } else {
-                // 默认停靠右侧、垂直 1/3 处
-                x = (dm.widthPixels - HudUi.dp(ctx, 250f)).toInt()
+                // 默认停靠右侧
+                x = (dm.widthPixels - HudUi.dp(ctx, 216f)).toInt()
                 y = dm.heightPixels / 4
             }
         }
@@ -493,15 +544,15 @@ class OverlayService : Service() {
             return
         }
 
-        // 头部拖拽移动 (≡ 手柄区域) + 双击折叠/展开
+        // 头部拖拽移动 + 双击折叠/展开
         var downRawX = 0f
         var downRawY = 0f
         var lpStartX = 0
         var lpStartY = 0
         var dragMoved = false
         var lastTapMs = 0L
-        val maxTbX = dm.widthPixels - HudUi.dp(ctx, 60f).toInt()
-        val maxTbY = dm.heightPixels - HudUi.dp(ctx, 40f).toInt()
+        val maxTbX = dm.widthPixels - HudUi.dp(ctx, 48f).toInt()
+        val maxTbY = dm.heightPixels - HudUi.dp(ctx, 36f).toInt()
         header.setOnTouchListener { _, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -530,7 +581,6 @@ class OverlayService : Service() {
                     if (dragMoved) {
                         prefs.edit().putInt("tb_x", tbLp.x).putInt("tb_y", tbLp.y).apply()
                     } else {
-                        // 双击标题区折叠/展开
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastTapMs < 300) {
                             setCollapsed(!collapsed)
@@ -600,15 +650,15 @@ class OverlayService : Service() {
             start()
         }
 
-        // 周期刷新状态芯片
+        // 周期刷新状态行
         val runnable = object : Runnable {
             override fun run() {
-                tvReader.text = if (readerConnected) "读取器 ✓" else "读取器 ×"
-                tvReader.setTextColor(if (readerConnected) HudUi.ACCENT else HudUi.TEXT_DIM)
-                tvFps.text = "FPS $fps"
-                tvFps.setTextColor(if (fps > 0) HudUi.TEXT_MAIN else HudUi.TEXT_DIM)
-                tvCount.text = "敌 $enemyAlive / 我 $allyAlive"
-                tvStatusFull.text = readerStatus
+                val conn = if (readerConnected) "连接✓" else "连接×"
+                tvStatusLine?.text = "$conn  FPS $fps  敌 $enemyAlive 我 $allyAlive"
+                tvStatusLine?.setTextColor(
+                    if (readerConnected) HudUi.ACCENT else HudUi.TEXT_DIM
+                )
+                tvDeployLine?.text = readerStatus
                 statusDotDrawable?.setColor(
                     when {
                         readerConnected -> HudUi.ACCENT
@@ -621,15 +671,6 @@ class OverlayService : Service() {
         }
         statusRunnable = runnable
         mainHandler?.post(runnable)
-    }
-
-    private fun adjustRadar(deltaDp: Int) {
-        // radarSize 为 px; 存储与步进以 dp 为单位
-        val curDp = (radarSize / resources.displayMetrics.density).toInt()
-        val newDp = (curDp + deltaDp).coerceIn(200, 640)
-        radarSize = HudUi.dp(this, newDp.toFloat()).toInt()
-        espView?.setMapSize(radarSize)
-        prefs.edit().putInt("radar", newDp).apply()
     }
 
     private fun setCollapsed(v: Boolean) {
@@ -718,9 +759,9 @@ class OverlayService : Service() {
         DeployLogger.init(this)
         val ctx = this
         val dm = resources.displayMetrics
-        val panelW = HudUi.dp(ctx, 340f).toInt()
-        val panelH = HudUi.dp(ctx, 480f).toInt()
-        val pad = HudUi.dp(ctx, 10f).toInt()
+        val panelW = HudUi.dp(ctx, 300f).toInt()
+        val panelH = HudUi.dp(ctx, 400f).toInt()
+        val pad = HudUi.dp(ctx, 9f).toInt()
 
         val root = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
@@ -856,7 +897,6 @@ class OverlayService : Service() {
     /** 切换 tab 并刷新内容 (诊断 tab 为即时采集, 后台执行)。 */
     private fun refreshLogPanel(tab: Int) {
         logCurrentTab = tab
-        // tab 高亮: 当前 tab 用 ACCENT 描边样式 (重设 background)
         logTabButtons.forEachIndexed { i, b ->
             b ?: return@forEachIndexed
             val active = i == tab
@@ -900,7 +940,6 @@ class OverlayService : Service() {
 
     private fun postScrollToBottom() {
         logPanelView?.post {
-            // 内容区是 root 的最后一个子 View (ScrollView)
             val root = logPanelView as? LinearLayout ?: return@post
             for (i in root.childCount - 1 downTo 0) {
                 val c = root.getChildAt(i)
@@ -942,5 +981,3 @@ class OverlayService : Service() {
         startForeground(NOTIF_ID, notif)
     }
 }
-
-

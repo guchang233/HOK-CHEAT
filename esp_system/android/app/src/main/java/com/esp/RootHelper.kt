@@ -66,12 +66,21 @@ object RootHelper {
             suStdin = DataOutputStream(p.outputStream)
             suStdout = BufferedReader(InputStreamReader(p.inputStream))
 
-            // 探测: 等 shell 就绪并确认 uid=0 (授权弹窗发生在这里, 仅此一次)
+            // 探测: 等 shell 就绪并确认 uid=0 (授权弹窗发生在这里, 仅此一次)。
+            // 注意: 部分 root 管理器 (Magisk/KernelSU/SuperSU) 会在 uid 行之前
+            // 先输出 banner 行, 只读一行会误判失败 → 杀 shell → 下次重新拉起
+            // su → 再次弹授权窗。这里循环读取直到出现 uid 行 (或 su 退出)。
             suStdin!!.writeBytes("id\n")
             suStdin!!.flush()
-            val first = suStdout!!.readLine()
-            shellReady = first != null && first.contains("uid=0")
-            DeployLogger.i("Root", "su 响应: ${first ?: "(无输出)"} → ${if (shellReady) "授权成功" else "未授权"}")
+            var uidLine: String? = null
+            var bannerLines = 0
+            while (bannerLines < 12) {
+                val line = suStdout!!.readLine() ?: break   // su 退出 (被拒绝)
+                if (line.contains("uid=")) { uidLine = line; break }
+                if (line.isNotBlank()) bannerLines++
+            }
+            shellReady = uidLine != null && uidLine.contains("uid=0")
+            DeployLogger.i("Root", "su 响应: ${uidLine ?: "(无 uid 输出)"} → ${if (shellReady) "授权成功" else "未授权"}")
             if (!shellReady) killShell()
             shellReady
         } catch (e: Exception) {

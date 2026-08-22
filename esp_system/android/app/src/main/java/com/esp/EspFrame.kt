@@ -14,6 +14,7 @@ data class EspActor(
     val type: Int,
     val x: Float,
     val z: Float,
+    val y: Float,
     val ally: Boolean,
     val hp: Int,
     val maxHp: Int,
@@ -61,11 +62,11 @@ data class EspFrame(
     val gameTime: Float,
     val selfX: Float,
     val selfZ: Float,
+    val selfY: Float,
     val status: String
 ) {
     companion object {
         private const val MAGIC = "TVEF"
-        private const val VERSION = 2
 
         private const val SKILL_SIZE = 13
         private const val TIMER_SIZE = 19
@@ -75,17 +76,21 @@ data class EspFrame(
             val magic = ByteArray(4).also { buf.get(it) }
             if (String(magic) != MAGIC) throw IllegalArgumentException("Bad magic")
             val version = buf.get().toInt()
-            if (version != VERSION) throw IllegalArgumentException("Bad version $version")
+            if (version !in 2..3) throw IllegalArgumentException("Bad version $version")
             val frameId = buf.int.toUInt()
             val gameTime = buf.float
             val selfX = buf.float
             val selfZ = buf.float
+            // v3 新增: 自身高度 (用于屏幕投影)
+            val selfY = if (version >= 3) buf.float else 0f
 
             val actorCount = buf.get().toInt() and 0xFF
             val actors = (0 until actorCount).map {
                 val type = buf.int
                 val x = buf.float
                 val z = buf.float
+                // v3 新增: actor 高度
+                val y = if (version >= 3) buf.float else 0f
                 val ally = buf.get() != 0.toByte()
                 val hp = buf.int
                 val maxHp = buf.int
@@ -106,7 +111,7 @@ data class EspFrame(
                 val facing = buf.float
                 val speed = buf.float
                 EspActor(
-                    type = type, x = x, z = z, ally = ally,
+                    type = type, x = x, z = z, y = y, ally = ally,
                     hp = hp, maxHp = maxHp, visible = visible,
                     nameId = nameId, level = level,
                     ultimateCooldown = ultCd, ultimateTotal = ultTotal,
@@ -127,7 +132,7 @@ data class EspFrame(
                 EspGlobalTimer(id, respawn, max, active, label)
             }
 
-            return EspFrame(frameId, actors, timers, gameTime, selfX, selfZ, "ok")
+            return EspFrame(frameId, actors, timers, gameTime, selfX, selfZ, selfY, "ok")
         }
     }
 }

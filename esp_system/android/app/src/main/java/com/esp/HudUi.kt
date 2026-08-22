@@ -107,6 +107,7 @@ class PillToggle(
     ctx: Context,
     private val label: String,
     initial: Boolean,
+    compact: Boolean = false,
     private val onChange: (Boolean) -> Unit
 ) : View(ctx) {
 
@@ -118,14 +119,16 @@ class PillToggle(
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = HudUi.TEXT_MAIN
         textSize = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_SP, 11f, ctx.resources.displayMetrics)
+            TypedValue.COMPLEX_UNIT_SP, if (compact) 10f else 11f,
+            ctx.resources.displayMetrics)
         isFakeBoldText = true
     }
     private val trackRect = RectF()
     private val density = ctx.resources.displayMetrics.density
-    private val trackW = 34f * density
-    private val trackH = 16f * density
-    private val knobR = 6.5f * density
+    private val trackW = (if (compact) 28f else 34f) * density
+    private val trackH = (if (compact) 13f else 16f) * density
+    private val knobR = (if (compact) 5.2f else 6.5f) * density
+    private val gap = (if (compact) 8f else 10f) * density
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val wm = View.MeasureSpec.getMode(widthMeasureSpec)
@@ -133,13 +136,13 @@ class PillToggle(
         val hm = View.MeasureSpec.getMode(heightMeasureSpec)
         val hs = View.MeasureSpec.getSize(heightMeasureSpec)
         val textW = textPaint.measureText(label)
-        val contentW = trackW + 10f * density + textW + 8f * density
+        val contentW = trackW + gap + textW + 6f * density
         val w = when (wm) {
             View.MeasureSpec.EXACTLY -> ws
             View.MeasureSpec.AT_MOST -> minOf(contentW.toInt(), ws)
             else -> contentW.toInt()
         }
-        val h = if (hm == View.MeasureSpec.EXACTLY) hs else (30f * density).toInt()
+        val h = if (hm == View.MeasureSpec.EXACTLY) hs else (26f * density).toInt()
         setMeasuredDimension(w, h)
     }
 
@@ -163,7 +166,7 @@ class PillToggle(
         canvas.drawCircle(kx, cy, knobR, knobPaint)
         // 标签
         textPaint.color = if (on) HudUi.TEXT_MAIN else HudUi.TEXT_DIM
-        canvas.drawText(label, trackW + 10f * density,
+        canvas.drawText(label, trackW + gap,
             cy - (textPaint.ascent() + textPaint.descent()) / 2f, textPaint)
     }
 
