@@ -337,6 +337,9 @@ def build_tv_reader_ndk(ndk: Path, sdk: Path, out_dir: Path) -> dict:
     abi_targets = {
         "arm64_v8a": "arm64-v8a",
         "armeabi_v7a": "armeabi-v7a",
+        # 模拟器 (雷电/MuMu) 是 x86_64 + ARM 转译; root shell 下裸执行 ARM ELF
+        # 不经过转译路径, 必须提供原生 x86_64 二进制
+        "x86_64": "x86_64",
     }
 
     results = {}
@@ -650,24 +653,43 @@ def build_probe_apks(game_apk: Path, dex: Path, tv_bins: dict,
     return probes
 
 
-def build_esp_overlay_apk(sdk: Path, tv_reader_bin: Path, out_dir: Path,
+def build_esp_overlay_apk(sdk: Path, tv_bins: dict, out_dir: Path,
                            game_pkg: str, port: int) -> Path | None:
-    """Build the ESP overlay APK with embedded tv_reader binary (分体模式, 可选)."""
+    """Build the ESP overlay APK with embedded tv_reader binaries (分体模式, 可选).
+
+    嵌入全部已构建 ABI (arm64 + x86_64): 真机用 arm64, 雷电/MuMu 等
+    x86 模拟器 root shell 下无法执行 ARM ELF, 需原生 x86_64。
+    """
     section("Step 5d  构建独立 ESP Overlay APK (分体模式, 可选)")
-    
-    # Copy tv_reader into assets for embedding
+
+    # asset 名 → 构建产物键
+    asset_map = {
+        "arm64_v8a": "tv_reader_arm64",
+        "x86_64": "tv_reader_x64",
+    }
+
+    # Copy tv_reader binaries into assets
     assets_dir = ANDROID_DIR / "app" / "src" / "main" / "assets" / "native"
     assets_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Clean old assets
     for old in assets_dir.glob("tv_reader*"):
         old.unlink()
-    
-    # Copy the tv_reader binary (will be placed in assets)
-    target_asset = assets_dir / "tv_reader_arm64"
-    shutil.copy2(tv_reader_bin, target_asset)
-    target_asset.chmod(0o644)
-    info(f"嵌入 tv_reader ({tv_reader_bin.stat().st_size:,} bytes) → assets/native/tv_reader_arm64")
+
+    embedded = []
+    for abi_key, asset_name in asset_map.items():
+        src = tv_bins.get(abi_key)
+        if not src:
+            continue
+        target_asset = assets_dir / asset_name
+        shutil.copy2(src, target_asset)
+        target_asset.chmod(0o644)
+        embedded.append(asset_name)
+        info(f"嵌入 tv_reader {abi_key} ({src.stat().st_size:,} bytes) → assets/native/{asset_name}")
+
+    if not embedded:
+        fail("无可嵌入的 tv_reader 二进制")
+        return None
     
     # Build using gradle bootstrap
     wrapper = ANDROID_DIR / "gradlew_bootstrap.py"
@@ -691,11 +713,15 @@ def build_esp_overlay_apk(sdk: Path, tv_reader_bin: Path, out_dir: Path,
         if r.stdout: print(r.stdout[-300:])
         return None
     
-    # Find output APK
+    # Find output APK (限定 outputs 目录, 避免 rglob 误中缓存 APK)
     apk_found = None
-    for p in ANDROID_DIR.rglob("*.apk"):
-        apk_found = p
-        break
+    for pattern in ("app/build/outputs/apk/debug/*.apk",
+                    "app/build/outputs/apk/release/*.apk"):
+        for p in ANDROID_DIR.glob(pattern):
+            apk_found = p
+            break
+        if apk_found:
+            break
     
     if not apk_found:
         fail("No APK produced")
@@ -1015,8 +1041,8 @@ def main():
                 warn("NDK 不可用，尝试复用历史构建产物")
                 p(C.Y, "    请安装 NDK: sdkmanager 'ndk;25.2.9519653'")
                 # 本地无 NDK 时回退: 复用上次构建的二进制 (源码未变时安全)
-                for abi, sub in (("arm64_v8a", "ndk_arm64"), ("armeabi_v7a", "ndk_v7a")):
-                    prev = ROOT / "build_ultimate" / sub / "tv_reader"
+                for abi in ("arm64_v8a", "armeabi_v7a", "x86_64"):
+                    prev = out_dir / f"tv_reader_{abi}"
                     if prev.exists():
                         tv_bins[abi] = prev
                         info(f"  复用 {prev}")
@@ -1046,14 +1072,11 @@ def main():
 
             # ---- Step 5d: 独立 ESP Overlay APK (分体模式, 可选) ----
             if args.with_overlay:
-                arm64_bin = tv_bins.get("arm64_v8a")
                 if not tv_bins:
                     warn("tv_reader 不可用，跳过独立 ESP Overlay APK")
-                elif arm64_bin is None:
-                    warn("缺少 arm64 二进制，跳过独立 ESP Overlay APK")
                 else:
                     esp_apk_path = build_esp_overlay_apk(
-                        sdk, arm64_bin, out_dir,
+                        sdk, tv_bins, out_dir,
                         args.game_pkg, args.port
                     )
     else:

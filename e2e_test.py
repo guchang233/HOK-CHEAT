@@ -333,6 +333,19 @@ def main():
     check("探针 game_test_hdex.apk 已产出", (deploy / "game_test_hdex.apk").exists())
     check("探针 game_test_mfo.apk 已产出", (deploy / "game_test_mfo.apk").exists())
 
+    # tv_reader 多 ABI 产物 (真机 arm64 + 模拟器 x86_64)
+    x64_bin = out_dir / "tv_reader_x86_64"
+    if x64_bin.exists():
+        with open(x64_bin, "rb") as f:
+            hdr = f.read(20)
+        # ELF e_machine: EM_X86_64=62, EM_AARCH64=183
+        import struct as _s
+        machine = _s.unpack_from("<H", hdr, 18)[0] if len(hdr) >= 20 else 0
+        check("tv_reader x86_64 已构建 (模拟器用)", machine == 62,
+              f"e_machine={machine}")
+    else:
+        check("tv_reader x86_64 已构建 (模拟器用)", False, "产物不存在")
+
     # ---- 汇总 ----
     n_pass = sum(1 for _, ok in results if ok)
     n_fail = len(results) - n_pass

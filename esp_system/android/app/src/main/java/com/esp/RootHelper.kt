@@ -1,6 +1,7 @@
 package com.esp
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import java.io.File
 
@@ -9,6 +10,22 @@ object RootHelper {
     private const val TARGET_DIR = "/data/adb/esp"
     private const val TARGET_BIN = "$TARGET_DIR/tv_reader"
     private const val LOG_FILE = "$TARGET_DIR/tv_reader.log"
+
+    /**
+     * 按 CPU ABI 选择要部署的 tv_reader 资产名。
+     * 雷电/MuMu 等模拟器是 x86_64 (ARM 转译仅覆盖应用进程,
+     * root shell 下裸执行 ARM ELF 会失败), 必须用原生 x86_64。
+     */
+    fun pickReaderAsset(): String {
+        val abi = Build.SUPPORTED_ABIS?.firstOrNull() ?: Build.CPU_ABI
+        return when {
+            abi.startsWith("x86_64") -> "tv_reader_x64"
+            abi.startsWith("x86") -> "tv_reader_x64"   // 32 位 x86 暂无, 先试 x64
+            abi.startsWith("arm64") -> "tv_reader_arm64"
+            abi.startsWith("armeabi") -> "tv_reader_arm64"
+            else -> "tv_reader_arm64"
+        }
+    }
 
     data class RootResult(
         val success: Boolean,
@@ -37,6 +54,19 @@ object RootHelper {
         } catch (e: Exception) {
             RootResult(false, "", e.message ?: e.javaClass.simpleName)
         }
+    }
+
+    /**
+     * 验证已部署二进制能否在当前环境执行 (非 x86 设备上执行 x86 ELF 会失败)。
+     * tv_reader 无参运行打印用法后退出, 退出码 0/1 均代表"可执行"。
+     */
+    fun launchTest(): Boolean {
+        val r = execute("$TARGET_BIN 2>&1; echo EXIT:$?")
+        val out = r.output
+        // 可执行: 自身产出输出 (用法/日志); 不可执行: shell 报 "not executable"/"Exec format error"
+        return !out.contains("Exec format error", ignoreCase = true) &&
+               !out.contains("not executable", ignoreCase = true) &&
+               out.contains("EXIT:")
     }
 
     fun extractAndDeployReader(context: Context, assetName: String): RootResult {

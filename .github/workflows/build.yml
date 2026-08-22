@@ -119,7 +119,7 @@ jobs:
           ls -la official.apk
           file official.apk || true
 
-      - name: Build all-in-one embedded APK
+      - name: Build split-mode APKs (official game + ESP overlay)
         if: steps.apksrc.outputs.url != ''
         run: |
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"

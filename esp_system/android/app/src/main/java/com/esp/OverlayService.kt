@@ -195,8 +195,13 @@ class OverlayService : Service() {
                     return@Thread
                 }
 
-                val assetName = "tv_reader_arm64"
-                val deployResult = RootHelper.extractAndDeployReader(this, assetName)
+                val primary = RootHelper.pickReaderAsset()
+                val fallback = if (primary == "tv_reader_x64") "tv_reader_arm64" else "tv_reader_x64"
+                var deployResult = RootHelper.extractAndDeployReader(this, primary)
+                if (!deployResult.success || !RootHelper.launchTest()) {
+                    Log.w(TAG, "primary asset $primary failed, trying $fallback")
+                    deployResult = RootHelper.extractAndDeployReader(this, fallback)
+                }
                 if (!deployResult.success) {
                     readerStatus = "DEPLOY FAIL: ${deployResult.error}"
                     return@Thread
