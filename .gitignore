@@ -18,6 +18,9 @@ output/
 *.dex
 *.so
 
+# 例外: 预构建产物 (供用户直接下载的小文件)
+!prebuilt/*.apk
+
 # Android / Gradle
 .gradle/
 esp_system/android/.gradle/
